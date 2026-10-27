@@ -8,8 +8,9 @@ use crate::hud::HudRenderer;
 use crate::mesh::{cube_mesh, ground_plane_mesh, Vertex};
 use crate::model::CpuModel;
 use crate::post::PostProcess;
+use crate::settings::{PresentModeSetting, Settings};
 use crate::shadow::{
-    compute_light_view_proj, ShadowPass, ShadowQuality, SHADOW_NORMAL_BIAS, SHADOW_ORTHO_RADIUS,
+    compute_light_view_proj, ShadowPass, SHADOW_NORMAL_BIAS, SHADOW_ORTHO_RADIUS,
 };
 use crate::sky::SkyRenderer;
 use crate::stats::{FrameMetrics, GpuTimer, HudTelemetry};
@@ -384,39 +385,42 @@ impl Renderer {
         self.is_surface_configured = true;
     }
 
-    pub fn toggle_present_mode(&mut self) -> wgpu::PresentMode {
-        self.config.present_mode = if self.config.present_mode == wgpu::PresentMode::Fifo {
-            self.fast_present_mode
-        } else {
-            wgpu::PresentMode::Fifo
+    pub fn apply_settings(&mut self, settings: &Settings) {
+        let desired_pm = match settings.present_mode {
+            PresentModeSetting::Fifo => wgpu::PresentMode::Fifo,
+            PresentModeSetting::Fast => self.fast_present_mode,
         };
-        if self.size.width > 0 && self.size.height > 0 {
-            self.surface.configure(&self.device, &self.config);
-            self.is_surface_configured = true;
+        if self.config.present_mode != desired_pm {
+            self.config.present_mode = desired_pm;
+            if self.size.width > 0 && self.size.height > 0 {
+                self.surface.configure(&self.device, &self.config);
+                self.is_surface_configured = true;
+            }
         }
-        println!("Present mode toggled (F1): {:?}", self.config.present_mode);
-        self.config.present_mode
-    }
 
-    pub fn toggle_render_scale(&mut self) -> f32 {
-        let new_scale = self.post.toggle_scale(&self.device, self.config.width, self.config.height);
-        let (scene_w, scene_h) = self.post.scene_target_size();
-        self.depth_view = create_depth_view(&self.device, scene_w, scene_h);
-        println!("Render scale toggled (F2): {:.2}x ({}x{})", new_scale, scene_w, scene_h);
-        new_scale
-    }
+        if (self.post.scale() - settings.render_scale).abs() > 1e-4 {
+            self.post.set_scale(
+                &self.device,
+                settings.render_scale,
+                self.config.width,
+                self.config.height,
+            );
+            let (scene_w, scene_h) = self.post.scene_target_size();
+            self.depth_view = create_depth_view(&self.device, scene_w, scene_h);
+        }
 
-    pub fn cycle_shadow_quality(&mut self) -> ShadowQuality {
-        let quality = self.shadow_pass.cycle_quality(&self.device);
-        self.scene_bind_group = create_scene_bind_group(
-            &self.device,
-            &self.scene_bind_group_layout,
-            &self.scene_uniform_buffer,
-            self.shadow_pass.depth_view(),
-            self.shadow_pass.comparison_sampler(),
-        );
-        println!("Shadow quality cycled (F4): {}", quality.label());
-        quality
+        if self.shadow_pass.quality() != settings.shadow_quality {
+            while self.shadow_pass.quality() != settings.shadow_quality {
+                self.shadow_pass.cycle_quality(&self.device);
+            }
+            self.scene_bind_group = create_scene_bind_group(
+                &self.device,
+                &self.scene_bind_group_layout,
+                &self.scene_uniform_buffer,
+                self.shadow_pass.depth_view(),
+                self.shadow_pass.comparison_sampler(),
+            );
+        }
     }
 
     pub fn render(

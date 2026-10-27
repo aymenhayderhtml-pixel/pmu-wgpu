@@ -35,6 +35,27 @@ impl WaveManager {
         *self = Self::new(seed);
     }
 
+    pub fn rng_state(&self) -> u64 {
+        self.rng_state
+    }
+
+    pub fn restore_state(
+        &mut self,
+        current_wave: u32,
+        pending_spawns: u32,
+        intermission_timer: f32,
+        score: u32,
+        rng_state: u64,
+        next_enemy_id: u32,
+    ) {
+        self.current_wave = current_wave.max(1);
+        self.pending_spawns = pending_spawns;
+        self.intermission_timer = intermission_timer.max(0.0);
+        self.score = score;
+        self.rng_state = rng_state;
+        self.next_enemy_id = next_enemy_id.max(1);
+    }
+
     #[inline]
     pub fn enemies_for_wave_with_allies(wave: u32, living_allies: u32) -> u32 {
         WAVE_1_ENEMIES + wave.saturating_sub(1) * WAVE_INCREMENT + living_allies
@@ -45,7 +66,6 @@ impl WaveManager {
     }
 
     /// Updates wave spawning and returns `true` if a new wave just started this step.
-    #[allow(clippy::too_many_arguments)]
     pub fn update(
         &mut self,
         dt: f32,

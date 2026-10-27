@@ -82,7 +82,9 @@ pub struct NavGrid {
 
 impl NavGrid {
     pub fn new(aabbs: &[Aabb]) -> Self {
-        let mut blocked = vec![false; NAV_TOTAL_CELLS];
+        let mut grid = Self {
+            blocked: vec![false; NAV_TOTAL_CELLS],
+        };
 
         for cz in 0..NAV_GRID_DIM {
             for cx in 0..NAV_GRID_DIM {
@@ -92,14 +94,14 @@ impl NavGrid {
                         && aabb.min.y < 2.0
                         && circle_overlaps_aabb_xz(center.x, center.y, ENEMY_NAV_RADIUS + 0.35, aabb)
                     {
-                        blocked[cz * NAV_GRID_DIM + cx] = true;
+                        grid.set_blocked(cx, cz, true);
                         break;
                     }
                 }
             }
         }
 
-        Self { blocked }
+        grid
     }
 
     #[inline]
@@ -111,7 +113,6 @@ impl NavGrid {
     }
 
     #[inline]
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn set_blocked(&mut self, cx: usize, cz: usize, is_blocked: bool) {
         if cx < NAV_GRID_DIM && cz < NAV_GRID_DIM {
             self.blocked[cz * NAV_GRID_DIM + cx] = is_blocked;

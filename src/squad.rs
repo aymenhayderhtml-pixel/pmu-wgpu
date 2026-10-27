@@ -224,7 +224,7 @@ impl Squad {
         self.total_ally_casts = 0;
     }
 
-    pub fn _living_count(&self) -> u32 {
+    pub fn living_count(&self) -> u32 {
         self.allies.iter().filter(|a| a.is_living()).count() as u32
     }
 
@@ -405,7 +405,6 @@ impl Squad {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn update(
         &mut self,
         dt: f32,

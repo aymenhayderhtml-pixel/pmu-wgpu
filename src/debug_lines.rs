@@ -99,7 +99,6 @@ impl DebugLinesRenderer {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn prepare(
         &mut self,
         queue: &wgpu::Queue,

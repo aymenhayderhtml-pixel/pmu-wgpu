@@ -16,8 +16,12 @@ use crate::nav::{NavGrid, NavSearchScratch};
 use crate::pickups::PickupManager;
 use crate::player_anim::{AnimMode, ClipMap, PlayerAnimator};
 use crate::projectiles::{apply_skill_hit_to_enemy, ProjectileManager, SkillDamageHit};
+use crate::game_flow::GameFlow;
+use crate::save::{
+    current_unix_seconds, SaveData, SavedAlly, SavedEnemy, WavePhase, SAVE_VERSION,
+};
 use crate::skill_inv::{PickupOutcome, SkillInventory};
-use crate::skill_menu::{GameState, MenuState};
+use crate::skill_menu::MenuState;
 use crate::skills::{
     compute_aim_direction_xz, level_multiplier, SkillId, SkillKind, CAST_SPEED_MULT,
 };
@@ -161,7 +165,10 @@ pub struct World {
     pub waves: WaveManager,
     pub skill_inv: SkillInventory,
     pub menu: MenuState,
-    pub game_state: GameState,
+    pub game_flow: GameFlow,
+    pub playtime_seconds: f64,
+    pub total_kills: u32,
+    pub autosave_requested: bool,
     pub projectiles: ProjectileManager,
     pub effects: EffectsPool,
     pub pickups: PickupManager,
@@ -188,7 +195,6 @@ pub struct World {
 }
 
 impl World {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         player_model_id: Option<usize>,
         ally_model_id: Option<usize>,
@@ -282,7 +288,10 @@ impl World {
             waves: WaveManager::new(WORLD_SEED),
             skill_inv: SkillInventory::new(),
             menu: MenuState::new(),
-            game_state: GameState::Playing,
+            game_flow: GameFlow::MainMenu,
+            playtime_seconds: 0.0,
+            total_kills: 0,
+            autosave_requested: false,
             projectiles: ProjectileManager::new(),
             effects: EffectsPool::new(),
             pickups: PickupManager::new(WORLD_SEED),
@@ -324,14 +333,18 @@ impl World {
         world
     }
 
-    pub fn reset(&mut self) {
+    pub fn new_game(&mut self) {
         self.player = Player::new(self.spawn_pos);
         self.combat.reset();
         self.squad.reset(WORLD_SEED);
         self.enemies.clear();
         self.waves.reset(WORLD_SEED);
         self.skill_inv.reset();
-        self.menu.close(&mut self.game_state);
+        self.menu.close(&mut self.game_flow);
+        self.game_flow = GameFlow::Playing;
+        self.playtime_seconds = 0.0;
+        self.total_kills = 0;
+        self.autosave_requested = false;
         self.projectiles.clear();
         self.effects.clear();
         self.pickups.reset(WORLD_SEED);
@@ -343,13 +356,160 @@ impl World {
             0.0,
             &mut self.enemies,
             self.player.pos,
-            0,
+            self.squad.living_count(),
             &self.collision,
             &self.nav,
             node_count,
             init_clip,
         );
+    }
+
+    pub fn reset(&mut self) {
+        self.new_game();
         println!("Game reset (R): Squad cleared, Wave 1 started.");
+    }
+
+    pub fn to_save(&self) -> SaveData {
+        let wave_phase = if self.waves.pending_spawns == 0 && self.alive_enemy_count() == 0 {
+            WavePhase::Intermission
+        } else {
+            WavePhase::Active
+        };
+
+        let mut allies = Vec::with_capacity(self.squad.allies.len());
+        for a in &self.squad.allies {
+            let pool = a.rarity.name_pool();
+            let name_index = pool.iter().position(|&n| n == a.name).unwrap_or(0);
+            allies.push(SavedAlly {
+                rarity: a.rarity,
+                name_index,
+                health: a.health,
+                down: a.is_down(),
+                pos: a.pos,
+                hold_pos: a.hold_pos,
+            });
+        }
+
+        let mut enemies = Vec::with_capacity(self.enemies.len());
+        for e in &self.enemies {
+            if e.is_alive() {
+                enemies.push(SavedEnemy {
+                    pos: e.pos,
+                    health: e.health,
+                });
+            }
+        }
+
+        SaveData {
+            version: SAVE_VERSION,
+            created_unix: current_unix_seconds(),
+            playtime_seconds: self.playtime_seconds,
+            player_pos: self.player.pos,
+            player_yaw: self.player.yaw,
+            player_health: self.combat.health,
+            player_mana: self.skill_inv.mana,
+            total_kills: self.total_kills,
+            wave_number: self.waves.current_wave,
+            wave_phase,
+            intermission_timer: self.waves.intermission_timer,
+            pending_spawns: self.waves.pending_spawns,
+            score: self.waves.score,
+            skill_counts: self.skill_inv.counts,
+            skill_slots: self.skill_inv.slots,
+            squad_mode: self.squad.mode,
+            allies,
+            enemies,
+            wave_rng_state: self.waves.rng_state(),
+            squad_rng_state: self.squad.rng_state,
+            pickup_rng_state: self.pickups.rng_state,
+            first_wave_drop_pending: self.pickups.first_wave_drop_pending,
+        }
+    }
+
+    pub fn apply_save(&mut self, raw_save: &SaveData) {
+        let mut save = raw_save.clone();
+        save.validate_and_sanitize(&self.collision);
+
+        self.projectiles.clear();
+        self.effects.clear();
+        self.pickups.reset(WORLD_SEED);
+        self.pickups.rng_state = save.pickup_rng_state;
+        self.pickups.first_wave_drop_pending = save.first_wave_drop_pending;
+        self.floating_numbers.clear();
+        self.menu.close(&mut self.game_flow);
+        self.game_flow = GameFlow::Playing;
+        self.playtime_seconds = save.playtime_seconds;
+        self.total_kills = save.total_kills;
+        self.autosave_requested = false;
+
+        self.player = Player::new(save.player_pos);
+        self.player.yaw = save.player_yaw;
+        self.player.prev_yaw = save.player_yaw;
+
+        self.combat.reset();
+        self.combat.health = save.player_health;
+
+        self.skill_inv.reset();
+        self.skill_inv.counts = save.skill_counts;
+        self.skill_inv.slots = save.skill_slots;
+        self.skill_inv.mana = save.player_mana;
+
+        self.squad.reset(WORLD_SEED);
+        self.squad.mode = save.squad_mode;
+        self.squad.rng_state = save.squad_rng_state;
+        let ally_nodes = self.ally_skeleton.as_ref().map_or(0, |s| s.nodes.len());
+        let ally_clip = self.ally_clip_map.idle.unwrap_or(0);
+        for (idx, sa) in save.allies.iter().enumerate() {
+            let pool = sa.rarity.name_pool();
+            let name = pool[sa.name_index % pool.len()];
+            let mut ally = crate::ally::Ally::new(
+                (idx + 1) as u32,
+                name,
+                sa.rarity,
+                sa.pos,
+                save.player_yaw,
+                ally_nodes,
+                ally_clip,
+            );
+            ally.spawn_fx_timer = 0.0;
+            ally.hold_pos = sa.hold_pos;
+            if sa.down {
+                ally.health = 0.0;
+                ally.state = crate::ally::AllyState::Down;
+                ally.down_timer = 0.5;
+            } else {
+                ally.health = sa.health;
+            }
+            self.squad.allies.push(ally);
+        }
+
+        self.enemies.clear();
+        let enemy_nodes = self.enemy_skeleton.as_ref().map_or(0, |s| s.nodes.len());
+        let enemy_clip = self.enemy_clip_map.walk.unwrap_or(0);
+        for (idx, se) in save.enemies.iter().enumerate() {
+            let mut e = Enemy::new(
+                (idx + 1) as u32,
+                se.pos,
+                save.wave_rng_state ^ ((idx as u64 + 1) * 0x9E37_79B9_7F4A_7C15),
+                enemy_nodes,
+                enemy_clip,
+            );
+            e.health = se.health;
+            e.state = EnemyState::Wander;
+            self.enemies.push(e);
+        }
+
+        self.waves.restore_state(
+            save.wave_number,
+            match save.wave_phase {
+                WavePhase::Active => save.pending_spawns,
+                WavePhase::Intermission => 0,
+            },
+            save.intermission_timer,
+            save.score,
+            save.wave_rng_state,
+            (save.enemies.len() + 1) as u32,
+        );
     }
 
     pub fn summon_ally(&mut self) -> bool {
@@ -500,6 +660,7 @@ impl World {
                 let killed = apply_skill_hit_to_enemy(&mut self.enemies[idx], &hit);
                 self.floating_numbers.spawn(e_pos + Vec3::new(0.0, 2.1, 0.0), damage.round() as u32, false);
                 if killed {
+                    self.total_kills += 1;
                     self.waves.add_kill_score();
                     let _ = self.pickups.on_enemy_killed(e_pos, self.waves.current_wave);
                 }
@@ -582,13 +743,14 @@ impl World {
     }
 
     pub fn step_if_unpaused(&mut self, input: &mut Input, camera: &Camera, dt: f32) -> Option<AiStepStats> {
-        if self.game_state.is_paused() {
+        if self.game_flow.blocks_world_update() || self.game_flow.is_paused() {
             return None;
         }
         Some(self.update(input, camera, dt))
     }
 
     pub fn update(&mut self, input: &mut Input, camera: &Camera, dt: f32) -> AiStepStats {
+        self.playtime_seconds += f64::from(dt);
         self.player.prev_pos = self.player.pos;
         self.player.prev_yaw = self.player.yaw;
 
@@ -732,9 +894,10 @@ impl World {
                     && self.combat.try_register_swing_hit(enemy.id)
                 {
                     let e_pos = enemy.pos;
-                    let killed = enemy.apply_hit_from(SWING_DAMAGE, p_pos, ActorId::Player);
+                    let killed = enemy.apply_hit(SWING_DAMAGE, p_pos);
                     self.floating_numbers.spawn(e_pos + Vec3::new(0.0, 2.1, 0.0), SWING_DAMAGE as u32, false);
                     if killed {
+                        self.total_kills += 1;
                         self.waves.add_kill_score();
                         let _ = self.pickups.on_enemy_killed(e_pos, self.waves.current_wave);
                     }
@@ -751,6 +914,7 @@ impl World {
                 let killed = apply_skill_hit_to_enemy(enemy, &hit);
                 self.floating_numbers.spawn(e_pos + Vec3::new(0.0, 2.1, 0.0), hit.damage.round() as u32, false);
                 if killed {
+                    self.total_kills += 1;
                     self.waves.add_kill_score();
                     let _ = self.pickups.on_enemy_killed(e_pos, self.waves.current_wave);
                 }
@@ -773,6 +937,7 @@ impl World {
                     enemy.state_timer = 0.0;
                     enemy.death_timer = 0.0;
                     enemy.vel = Vec3::ZERO;
+                    self.total_kills += 1;
                     self.waves.add_kill_score();
                     let _ = self.pickups.on_enemy_killed(enemy.pos, self.waves.current_wave);
                 }
@@ -869,6 +1034,7 @@ impl World {
                 let killed = enemy.apply_hit_from(hit.damage, hit.attacker_pos, ActorId::Ally(hit.ally_id));
                 self.floating_numbers.spawn(e_pos + Vec3::new(0.0, 2.1, 0.0), hit.damage.round() as u32, false);
                 if killed {
+                    self.total_kills += 1;
                     self.waves.add_kill_score();
                     let _ = self.pickups.on_enemy_killed(e_pos, self.waves.current_wave);
                 }
@@ -950,10 +1116,15 @@ impl World {
         );
 
         if new_wave_started {
+            self.autosave_requested = true;
             for (r_pos, heal_amt) in self.squad.revive_all_down_for_new_wave() {
                 self.floating_numbers.spawn_kind(r_pos + Vec3::new(0.0, 2.2, 0.0), heal_amt, FloatingKind::Heal);
                 self.effects.spawn_heal_particles(r_pos);
             }
+        }
+
+        if self.combat.is_dead() {
+            self.game_flow = self.game_flow.on_player_death();
         }
 
         ai_stats
@@ -1020,7 +1191,6 @@ impl World {
         });
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn fill_visible_models(
         &self,
         model_id: usize,
@@ -1152,7 +1322,10 @@ mod tests {
             waves: WaveManager::new(WORLD_SEED),
             skill_inv: SkillInventory::new(),
             menu: MenuState::new(),
-            game_state: GameState::Playing,
+            game_flow: GameFlow::Playing,
+            playtime_seconds: 0.0,
+            total_kills: 0,
+            autosave_requested: false,
             projectiles: ProjectileManager::new(),
             effects: EffectsPool::new(),
             pickups: PickupManager::new(WORLD_SEED),
@@ -1417,15 +1590,13 @@ mod tests {
         let mut input = Input::new();
         let camera = Camera::new(Vec3::ZERO, 16.0 / 9.0);
 
-        // Open menu -> GameState becomes Paused -> step_if_unpaused does not advance simulation
-        world.menu.toggle(&mut world.game_state);
-        assert!(world.game_state.is_paused());
+        world.menu.toggle(&mut world.game_flow);
+        assert!(world.game_flow.is_paused());
         assert!(world.step_if_unpaused(&mut input, &camera, 1.0 / 60.0).is_none());
         assert_eq!(world.player.pos.x, 0.0);
 
-        // Close menu -> GameState becomes Playing -> step_if_unpaused advances simulation
-        world.menu.toggle(&mut world.game_state);
-        assert!(!world.game_state.is_paused());
+        world.menu.toggle(&mut world.game_flow);
+        assert!(!world.game_flow.is_paused());
         assert!(world.step_if_unpaused(&mut input, &camera, 1.0 / 60.0).is_some());
         assert!(world.player.pos.x > 0.0);
 
@@ -1483,5 +1654,55 @@ mod tests {
         let final_enemy_hp: f32 = world.enemies.iter().filter(|e| e.is_alive()).map(|e| e.health).sum();
         assert!(world.squad.total_ally_casts >= 1, "Epic ally must cast at least once");
         assert!(final_enemy_hp < initial_enemy_hp || world.waves.score > 0, "enemies must take damage");
+    }
+
+    #[test]
+    fn test_world_save_apply_and_300_step_loaded_simulation_and_new_game() {
+        let mut world = World::new(None, None, None, None, None, Vec::new(), None, Vec::new(), None, Vec::new());
+        world.new_game();
+
+        world.waves.score = 90;
+        assert!(world.summon_ally());
+        assert!(world.summon_ally());
+        world.squad.allies[1].apply_damage(999.0);
+        assert!(world.squad.allies[1].is_down());
+        world.combat.health = 77.0;
+        world.skill_inv.mana = 55.0;
+        let _ = world.skill_inv.add_skill_copy(SkillId::IceShard);
+        world.waves.current_wave = 4;
+        world.enemies[0].health = 22.0;
+
+        let saved = world.to_save();
+
+        // Mutate world and then restore from `saved`
+        world.new_game();
+        assert_eq!(world.waves.current_wave, 1);
+        assert_eq!(world.squad.allies.len(), 0);
+
+        world.apply_save(&saved);
+        assert_eq!(world.waves.current_wave, 4);
+        assert_eq!(world.waves.score, 30);
+        assert!((world.combat.health - 77.0).abs() < 1e-4);
+        assert!((world.skill_inv.mana - 55.0).abs() < 1e-4);
+        assert_eq!(world.skill_inv.count(SkillId::IceShard), 1);
+        assert_eq!(world.squad.allies.len(), 2);
+        assert!(world.squad.allies[1].is_down());
+        assert!((world.enemies[0].health - 22.0).abs() < 1e-4);
+
+        // Run 300 fixed updates on the restored world without panic and with no actor inside a cube
+        let mut input = Input::new();
+        let camera = Camera::new(world.player.pos, 16.0 / 9.0);
+        for _ in 0..300 {
+            world.update(&mut input, &camera, 1.0 / 60.0);
+            for aabb in world.collision.aabbs() {
+                assert!(!circle_overlaps_aabb_xz(world.player.pos.x, world.player.pos.z, PLAYER_RADIUS - 0.02, aabb));
+                for ally in &world.squad.allies {
+                    assert!(!circle_overlaps_aabb_xz(ally.pos.x, ally.pos.z, ALLY_RADIUS - 0.02, aabb));
+                }
+                for enemy in &world.enemies {
+                    assert!(!circle_overlaps_aabb_xz(enemy.pos.x, enemy.pos.z, ENEMY_RADIUS - 0.02, aabb));
+                }
+            }
+        }
     }
 }

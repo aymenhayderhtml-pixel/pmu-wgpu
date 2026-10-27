@@ -610,7 +610,6 @@ fn strip_cubic_tangents<T: Copy>(raw: Vec<T>, key_count: usize, is_cubic: bool) 
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn visit_node(
     node: &gltf::Node,
     parent_transform: Mat4,

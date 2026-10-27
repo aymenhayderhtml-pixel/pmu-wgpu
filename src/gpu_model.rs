@@ -52,7 +52,6 @@ pub struct ModelRenderer {
 }
 
 impl ModelRenderer {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         device: &wgpu::Device,
         queue: &wgpu::Queue,

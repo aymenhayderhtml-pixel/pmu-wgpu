@@ -2,10 +2,12 @@ use crate::ally::Ally;
 use crate::combat::FloatingNumber;
 use crate::enemy::Enemy;
 use crate::player_anim::AnimMode;
+use crate::game_flow::GameFlow;
+use crate::menu::MenuSystem;
 use crate::pickups::SkillOrb;
 use crate::shadow::ShadowQuality;
 use crate::skill_inv::{SkillHudInfo, SkillInventory};
-use crate::skill_menu::{GameState, MenuState};
+use crate::skill_menu::MenuState;
 use crate::squad::SquadMode;
 use glam::{Mat4, Vec3};
 use std::fmt::Write;
@@ -76,7 +78,10 @@ pub struct HudTelemetry<'a> {
     pub enemy_state_counts: [u32; 5],
     pub ally_state_counts: [u32; 6],
     pub squad_mode: SquadMode,
-    pub game_state: GameState,
+    pub game_flow: GameFlow,
+    pub hud_scale: u32,
+    pub fade_alpha: f32,
+    pub total_kills: u32,
     pub ally_casts: u32,
     pub status_message: &'a str,
     pub status_color: [f32; 3],
@@ -104,6 +109,7 @@ pub struct HudTelemetry<'a> {
     pub skills: SkillHudInfo,
     pub skill_inv: &'a SkillInventory,
     pub menu: &'a MenuState,
+    pub menu_sys: &'a MenuSystem,
     pub orbs: &'a [SkillOrb],
     pub allies: &'a [Ally],
     pub enemies: &'a [Enemy],
@@ -178,100 +184,30 @@ impl StatsTracker {
         self.last_metrics = metrics;
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn hud_telemetry<'a>(
-        &self,
-        player_pos: Vec3,
-        player_speed: f32,
-        player_grounded: bool,
-        player_health: f32,
-        player_max_health: f32,
-        player_dead: bool,
-        dodge_ready_ratio: f32,
-        wave_number: u32,
-        enemies_alive: u32,
-        score: u32,
-        enemy_state_counts: [u32; 5],
-        ally_state_counts: [u32; 6],
-        squad_mode: SquadMode,
-        game_state: GameState,
-        ally_casts: u32,
-        status_message: &'a str,
-        status_color: [f32; 3],
-        status_timer: f32,
-        mouse_captured: bool,
-        anim_mode: AnimMode,
-        anim_manual_override: bool,
-        anim_clip_name: &'a str,
-        anim_clip_time: f32,
-        joint_count: u32,
-        camera_yaw: f32,
-        skills: SkillHudInfo,
-        skill_inv: &'a SkillInventory,
-        menu: &'a MenuState,
-        orbs: &'a [SkillOrb],
-        allies: &'a [Ally],
-        enemies: &'a [Enemy],
-        floating_numbers: &'a [FloatingNumber],
-    ) -> HudTelemetry<'a> {
-        HudTelemetry {
-            show_panel: self.show_hud_panel,
-            mouse_captured,
-            fps: self.last_fps,
-            cpu_ms: self.last_cpu_ms,
-            gpu_total_and_shadow_ms: self.last_gpu_total_and_shadow,
-            player_pos,
-            player_speed,
-            player_grounded,
-            player_health,
-            player_max_health,
-            player_dead,
-            dodge_ready_ratio,
-            wave_number,
-            enemies_alive,
-            score,
-            enemy_state_counts,
-            ally_state_counts,
-            squad_mode,
-            game_state,
-            ally_casts,
-            status_message,
-            status_color,
-            status_timer,
-            astar_per_sec: self.last_astar_per_sec,
-            astar_avg_us: self.last_astar_avg_us,
-            draw_calls: self.last_metrics.draw_calls,
-            triangles: self.last_metrics.triangles,
-            skinned_triangles: self.last_metrics.skinned_triangles,
-            visible_instances: self.last_metrics.visible_instances,
-            total_instances: self.last_metrics.total_instances,
-            shadow_instances: self.last_metrics.shadow_instances,
-            shadow_quality: self.last_metrics.shadow_quality,
-            present_mode: self.last_metrics.present_mode,
-            render_scale: self.last_metrics.render_scale,
-            model_yaw_offset_rad: self.last_metrics.model_yaw_offset_rad,
-            anim_mode,
-            anim_manual_override,
-            anim_clip_name,
-            anim_clip_time,
-            joint_count,
-            view_proj: Mat4::IDENTITY,
-            camera_pos: Vec3::ZERO,
-            camera_yaw,
-            skills,
-            skill_inv,
-            menu,
-            orbs,
-            allies,
-            enemies,
-            floating_numbers,
-        }
+    pub fn fill_hud_metrics(&self, hud: &mut HudTelemetry<'_>) {
+        hud.show_panel = self.show_hud_panel;
+        hud.fps = self.last_fps;
+        hud.cpu_ms = self.last_cpu_ms;
+        hud.gpu_total_and_shadow_ms = self.last_gpu_total_and_shadow;
+        hud.astar_per_sec = self.last_astar_per_sec;
+        hud.astar_avg_us = self.last_astar_avg_us;
+        hud.draw_calls = self.last_metrics.draw_calls;
+        hud.triangles = self.last_metrics.triangles;
+        hud.skinned_triangles = self.last_metrics.skinned_triangles;
+        hud.visible_instances = self.last_metrics.visible_instances;
+        hud.total_instances = self.last_metrics.total_instances;
+        hud.shadow_instances = self.last_metrics.shadow_instances;
+        hud.shadow_quality = self.last_metrics.shadow_quality;
+        hud.present_mode = self.last_metrics.present_mode;
+        hud.render_scale = self.last_metrics.render_scale;
+        hud.model_yaw_offset_rad = self.last_metrics.model_yaw_offset_rad;
     }
 
     pub fn update_and_format_title<'a>(
         &'a mut self,
         raw_dt: f32,
         base_title: &str,
+        show_title_stats: bool,
     ) -> Option<&'a str> {
         self.stats_timer += raw_dt;
         if self.stats_timer < 1.0 {
@@ -303,7 +239,11 @@ impl StatsTracker {
         };
 
         self.title_buf.clear();
-        let _ = write!(&mut self.title_buf, "{} | FPS: {:.1} | CPU: {:.2} ms", base_title, fps, avg_cpu_ms);
+        if show_title_stats {
+            let _ = write!(&mut self.title_buf, "{} | FPS: {:.1} | CPU: {:.2} ms", base_title, fps, avg_cpu_ms);
+        } else {
+            self.title_buf.push_str(base_title);
+        }
 
         self.stats_timer = 0.0;
         self.rendered_frames = 0;

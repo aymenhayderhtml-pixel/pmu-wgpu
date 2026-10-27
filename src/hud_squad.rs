@@ -19,8 +19,9 @@ pub fn draw_squad_hud_elements(
     sh: f32,
     telemetry: &HudTelemetry<'_>,
 ) {
-    let glyph_px = (GLYPH_SIZE as f32) * HUD_SCALE;
-    let small_px = 12.0;
+    let scale_f = (telemetry.hud_scale.clamp(1, 3) as f32) / HUD_SCALE;
+    let glyph_px = (GLYPH_SIZE as f32) * (telemetry.hud_scale.clamp(1, 3) as f32);
+    let small_px = 12.0 * scale_f;
 
     // (a) Left-edge vertically centered Squad Panel
     {

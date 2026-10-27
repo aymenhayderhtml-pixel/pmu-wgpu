@@ -6,7 +6,7 @@ use crate::combat::{
 use crate::enemy::{
     Enemy, EnemyState, ATTACK_COOLDOWN, ATTACK_DAMAGE, ATTACK_RANGE, ATTACK_WINDUP, CHASE_SPEED,
     ENEMY_HEIGHT, ENEMY_RADIUS, HEARING_RANGE, LOSE_INTEREST_RANGE, LOSE_INTEREST_TIME,
-    REPATH_INTERVAL, REPATH_TARGET_DRIFT, SEPARATION_RADIUS, SEPARATION_WEIGHT,
+    MAX_ASTAR_PER_STEP, REPATH_INTERVAL, REPATH_TARGET_DRIFT, SEPARATION_RADIUS, SEPARATION_WEIGHT,
     SIGHT_HALF_ANGLE_RAD, SIGHT_RANGE, WANDER_SPEED,
 };
 use crate::nav::{NavGrid, NavSearchScratch};
@@ -153,14 +153,15 @@ pub fn collect_enemy_astar_requests(
 
         if !has_los {
             let drifted = enemy.path_goal.distance(target_xz) > REPATH_TARGET_DRIFT;
-            if enemy.path.is_empty() || enemy.path_index >= enemy.path.len() || drifted {
+            if (enemy.path.is_empty() || enemy.path_index >= enemy.path.len() || drifted)
+                && out_requests.iter().filter(|&&r| r).count() < MAX_ASTAR_PER_STEP
+            {
                 out_requests[i] = true;
             }
         }
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn update_enemies_with_targets(
     enemies: &mut Vec<Enemy>,
     actors: &[CombatantInfo],

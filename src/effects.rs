@@ -33,7 +33,7 @@ pub struct VisualEffect {
     pub position: Vec3,
     pub age: f32,
     pub lifetime: f32,
-    pub _scale: f32,
+    pub scale: f32,
     pub color: [f32; 3],
     pub active: bool,
 }
@@ -45,7 +45,7 @@ impl Default for VisualEffect {
             position: Vec3::ZERO,
             age: 0.0,
             lifetime: 0.5,
-            _scale: 1.0,
+            scale: 1.0,
             color: [1.0, 1.0, 1.0],
             active: false,
         }
@@ -110,7 +110,7 @@ impl EffectsPool {
             position,
             age: 0.0,
             lifetime: lifetime.max(0.05),
-            _scale: scale,
+            scale,
             color,
             active: true,
         };
@@ -232,8 +232,8 @@ impl EffectsPool {
                         }
                     }
                     EffectKind::PickupSparkle => {
-                        let dist = 0.25 + 1.35 * t;
-                        let sz = (0.18 * fade).max(0.04);
+                        let dist = (0.25 + 1.35 * t) * e.scale;
+                        let sz = (0.18 * fade * e.scale).max(0.04);
                         for i in 0..6 {
                             let angle = (i as f32) * (std::f32::consts::TAU / 6.0);
                             let p = e.position

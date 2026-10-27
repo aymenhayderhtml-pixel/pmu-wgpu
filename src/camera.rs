@@ -15,15 +15,23 @@ pub const CAMERA_COLLISION_MARGIN: f32 = 0.15;
 
 pub const PITCH_MIN: f32 = -80.0_f32.to_radians();
 pub const PITCH_MAX: f32 = 80.0_f32.to_radians();
-pub const FOV_Y_RADIANS: f32 = 60.0_f32.to_radians();
+pub const FOV_Y_RADIANS: f32 = 70.0_f32.to_radians();
 pub const Z_NEAR: f32 = 0.1;
 pub const Z_FAR: f32 = 200.0;
+
+pub const MAIN_MENU_ORBIT_RADIUS: f32 = 30.0;
+pub const MAIN_MENU_ORBIT_HEIGHT: f32 = 14.0;
+pub const MAIN_MENU_ORBIT_SPEED: f32 = 0.08;
 
 pub struct Camera {
     pub yaw: f32,
     pub pitch: f32,
     pub focus: Vec3,
     pub current_dist: f32,
+    pub fov_y_radians: f32,
+    pub mouse_sens_mult: f32,
+    pub menu_orbit_angle: f32,
+    pub in_main_menu_orbit: bool,
     prev_yaw: f32,
     prev_pitch: f32,
     prev_focus: Vec3,
@@ -39,12 +47,24 @@ impl Camera {
             pitch: initial_pitch,
             focus: initial_target,
             current_dist: CAMERA_DISTANCE,
+            fov_y_radians: FOV_Y_RADIANS,
+            mouse_sens_mult: 1.0,
+            menu_orbit_angle: 0.0,
+            in_main_menu_orbit: false,
             prev_yaw: 0.0,
             prev_pitch: initial_pitch,
             prev_focus: initial_target,
             prev_dist: CAMERA_DISTANCE,
             aspect: aspect.max(0.01),
         }
+    }
+
+    pub fn update_main_menu_orbit(&mut self, dt: f32) {
+        self.in_main_menu_orbit = true;
+        self.menu_orbit_angle =
+            (self.menu_orbit_angle + MAIN_MENU_ORBIT_SPEED * dt).rem_euclid(std::f32::consts::TAU);
+        self.yaw = self.menu_orbit_angle;
+        self.prev_yaw = self.yaw;
     }
 
     pub fn set_aspect(&mut self, width: u32, height: u32) {
@@ -61,12 +81,14 @@ impl Camera {
         collision: &CollisionGrid,
         dt: f32,
     ) {
+        self.in_main_menu_orbit = false;
         self.prev_yaw = self.yaw;
         self.prev_pitch = self.pitch;
         self.prev_focus = self.focus;
         self.prev_dist = self.current_dist;
 
-        let mut yaw_delta = -mouse_delta.0 * MOUSE_SENSITIVITY;
+        let eff_sens = MOUSE_SENSITIVITY * self.mouse_sens_mult;
+        let mut yaw_delta = -mouse_delta.0 * eff_sens;
         if input.is_pressed(KeyCode::ArrowLeft) {
             yaw_delta += CAMERA_SENSITIVITY * dt;
         }
@@ -75,7 +97,7 @@ impl Camera {
         }
         self.yaw = (self.yaw + yaw_delta).rem_euclid(std::f32::consts::TAU);
 
-        let mut pitch_delta = mouse_delta.1 * MOUSE_SENSITIVITY;
+        let mut pitch_delta = mouse_delta.1 * eff_sens;
         if input.is_pressed(KeyCode::ArrowUp) {
             pitch_delta += CAMERA_SENSITIVITY * dt;
         }
@@ -127,6 +149,18 @@ impl Camera {
 
     /// Computes the interpolated camera eye position and view-projection matrix.
     pub fn interpolated_view_proj_and_eye(&self, alpha: f32) -> (Mat4, Vec3) {
+        let proj = Mat4::perspective_rh(self.fov_y_radians, self.aspect, Z_NEAR, Z_FAR);
+        if self.in_main_menu_orbit {
+            let a = self.menu_orbit_angle;
+            let eye = Vec3::new(
+                a.sin() * MAIN_MENU_ORBIT_RADIUS,
+                MAIN_MENU_ORBIT_HEIGHT,
+                a.cos() * MAIN_MENU_ORBIT_RADIUS,
+            );
+            let view = Mat4::look_at_rh(eye, Vec3::new(0.0, 1.0, 0.0), Vec3::Y);
+            return (proj * view, eye);
+        }
+
         let t = alpha.clamp(0.0, 1.0);
         let focus = self.prev_focus.lerp(self.focus, t);
         let yaw = lerp_angle(self.prev_yaw, self.yaw, t);
@@ -138,7 +172,6 @@ impl Camera {
         let eye = target + orbit_dir * dist;
 
         let view = Mat4::look_at_rh(eye, target, Vec3::Y);
-        let proj = Mat4::perspective_rh(FOV_Y_RADIANS, self.aspect, Z_NEAR, Z_FAR);
         (proj * view, eye)
     }
 }

@@ -181,7 +181,6 @@ pub struct ShadowPass {
 }
 
 impl ShadowPass {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         device: &wgpu::Device,
         scene_uniform_buffer: &wgpu::Buffer,

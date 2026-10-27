@@ -135,19 +135,18 @@ impl PostProcess {
         &self.offscreen_view
     }
 
-    pub fn toggle_scale(
+    pub fn set_scale(
         &mut self,
         device: &wgpu::Device,
+        new_scale: f32,
         window_width: u32,
         window_height: u32,
-    ) -> f32 {
-        self.scale = if self.is_scaled() {
-            SCALE_FULL
-        } else {
-            SCALE_REDUCED
-        };
-        self.resize(device, window_width, window_height);
-        self.scale
+    ) {
+        let clamped = new_scale.clamp(0.5, SCALE_FULL);
+        if (self.scale - clamped).abs() > 1e-4 {
+            self.scale = clamped;
+            self.resize(device, window_width, window_height);
+        }
     }
 
     pub fn resize(&mut self, device: &wgpu::Device, window_width: u32, window_height: u32) {

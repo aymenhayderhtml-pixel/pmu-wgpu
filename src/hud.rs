@@ -3,6 +3,8 @@ use crate::enemy::EnemyState;
 use crate::font::{
     build_font_atlas_rgba8, glyph_uv, solid_white_uv, ATLAS_HEIGHT, ATLAS_WIDTH, GLYPH_SIZE,
 };
+use crate::game_flow::GameFlow;
+use crate::hud_menu::draw_active_menu_and_fade;
 use crate::hud_squad::draw_squad_hud_elements;
 use crate::stats::HudTelemetry;
 use bytemuck::{Pod, Zeroable};
@@ -222,8 +224,19 @@ impl HudRenderer {
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniform));
 
         self.vertex_scratch.clear();
-        let glyph_px = (GLYPH_SIZE as f32) * HUD_SCALE;
-        let line_step = glyph_px + 4.0 * HUD_SCALE;
+        let active_scale = (telemetry.hud_scale.clamp(1, 3)) as f32;
+        let glyph_px = (GLYPH_SIZE as f32) * active_scale;
+        let line_step = glyph_px + 4.0 * active_scale;
+
+        if telemetry.game_flow == GameFlow::MainMenu {
+            draw_active_menu_and_fade(&mut self.vertex_scratch, &mut self.text_scratch, sw, sh, telemetry);
+            let count = self.vertex_scratch.len().min(MAX_HUD_VERTICES);
+            self.visible_vertex_count = count as u32;
+            if count > 0 {
+                queue.write_buffer(&self.vertex_buffer, 0, bytemuck::cast_slice(&self.vertex_scratch[..count]));
+            }
+            return;
+        }
 
         // 1. World-space enemy health bars
         for enemy in telemetry.enemies {
@@ -469,7 +482,7 @@ impl HudRenderer {
             let _ = write!(
                 &mut self.text_scratch,
                 "St:{} AlCast:{} Prj:{} Fx:{} Orb:{} Inv[{}{}{}{}{}|{}{}{}{}]",
-                telemetry.game_state.label(),
+                telemetry.game_flow.label(),
                 telemetry.ally_casts,
                 telemetry.skills.active_projectiles,
                 telemetry.skills.active_effects,
@@ -489,19 +502,15 @@ impl HudRenderer {
         push_solid_quad(&mut self.vertex_scratch, hint_x, hint_y, hint_w, hint_h, [0.02, 0.03, 0.05, 0.68]);
         push_text_line(&mut self.vertex_scratch, CONTROLS_HINT, hint_x + 8.0, hint_y + 5.0, hint_glyph_px, [0.88, 0.90, 0.95, 1.0]);
 
-        // 8. Center crosshair dot or YOU DIED banner
-        if telemetry.player_dead {
-            let banner_px = glyph_px * 1.5;
-            let msg_w = (DEATH_MESSAGE.len() as f32) * banner_px;
-            let (mx, my) = ((sw - msg_w) * 0.5, (sh - banner_px) * 0.5);
-            push_solid_quad(&mut self.vertex_scratch, mx - 16.0, my - 14.0, msg_w + 32.0, banner_px + 28.0, [0.08, 0.01, 0.01, 0.88]);
-            push_text_line(&mut self.vertex_scratch, DEATH_MESSAGE, mx, my, banner_px, [1.0, 0.25, 0.22, 1.0]);
-        } else if telemetry.mouse_captured {
-            let dot_size = 2.0 * HUD_SCALE;
+        // 8. Center crosshair dot, pause/gameover menus, and screen fade overlay
+        if telemetry.mouse_captured && telemetry.game_flow == GameFlow::Playing && !telemetry.player_dead {
+            let dot_size = 2.0 * active_scale;
             let (cx, cy) = ((sw - dot_size) * 0.5, (sh - dot_size) * 0.5);
             push_solid_quad(&mut self.vertex_scratch, cx - 1.0, cy - 1.0, dot_size + 2.0, dot_size + 2.0, [0.0, 0.0, 0.0, 0.75]);
             push_solid_quad(&mut self.vertex_scratch, cx, cy, dot_size, dot_size, [1.0, 1.0, 1.0, 0.95]);
         }
+        let _ = DEATH_MESSAGE;
+        draw_active_menu_and_fade(&mut self.vertex_scratch, &mut self.text_scratch, sw, sh, telemetry);
 
         let count = self.vertex_scratch.len().min(MAX_HUD_VERTICES);
         self.visible_vertex_count = count as u32;
@@ -569,7 +578,6 @@ pub fn push_solid_quad(out: &mut Vec<HudVertex>, x: f32, y: f32, w: f32, h: f32,
     push_quad_uv(out, x, y, w, h, u0, v0, u1, v1, color);
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn push_quad_uv(out: &mut Vec<HudVertex>, x: f32, y: f32, w: f32, h: f32, u0: f32, v0: f32, u1: f32, v1: f32, color: [f32; 4]) {
     let (x0, y0, x1, y1) = (x, y, x + w, y + h);
     out.extend_from_slice(&[

@@ -1,27 +1,7 @@
+use crate::game_flow::GameFlow;
 use crate::skill_inv::{SkillInventory, FUSION_RECIPES, SLOT_COUNT};
 use crate::skills::{level_multiplier, SkillId, SkillKind, SKILL_COUNT, SKILL_TABLE};
 use std::fmt::Write;
-
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum GameState {
-    Playing,
-    Paused,
-}
-
-impl GameState {
-    #[inline]
-    pub fn is_paused(self) -> bool {
-        self == Self::Paused
-    }
-
-    #[inline]
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Playing => "Playing",
-            Self::Paused => "Paused",
-        }
-    }
-}
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum MenuSection {
@@ -46,13 +26,6 @@ impl MenuSection {
             Self::Recipes => Self::Slots,
         }
     }
-}
-
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum EscapeOutcome {
-    ClosedMenu,
-    ReleaseMouse,
-    ExitApp,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -91,32 +64,15 @@ impl MenuState {
         }
     }
 
-    pub fn toggle(&mut self, game_state: &mut GameState) {
-        self.open = !self.open;
-        *game_state = if self.open {
-            GameState::Paused
-        } else {
-            GameState::Playing
-        };
+    pub fn toggle(&mut self, flow: &mut GameFlow) {
+        *flow = flow.on_toggle_skill_menu();
+        self.open = *flow == GameFlow::SkillMenu;
     }
 
-    pub fn close(&mut self, game_state: &mut GameState) {
+    pub fn close(&mut self, flow: &mut GameFlow) {
         self.open = false;
-        *game_state = GameState::Playing;
-    }
-
-    pub fn handle_escape(
-        &mut self,
-        game_state: &mut GameState,
-        mouse_captured: bool,
-    ) -> EscapeOutcome {
-        if self.open {
-            self.close(game_state);
-            EscapeOutcome::ClosedMenu
-        } else if mouse_captured {
-            EscapeOutcome::ReleaseMouse
-        } else {
-            EscapeOutcome::ExitApp
+        if *flow == GameFlow::SkillMenu {
+            *flow = GameFlow::Playing;
         }
     }
 
@@ -373,7 +329,7 @@ mod tests {
     #[test]
     fn test_menu_navigation_and_section_switching() {
         let mut menu = MenuState::new();
-        let mut gs = GameState::Playing;
+        let mut gs = GameFlow::Playing;
 
         menu.toggle(&mut gs);
         assert!(menu.open);
@@ -460,25 +416,13 @@ mod tests {
     }
 
     #[test]
-    fn test_escape_behavior_in_menu_vs_game() {
+    fn test_close_skill_menu_returns_to_playing() {
         let mut menu = MenuState::new();
-        let mut gs = GameState::Playing;
-
+        let mut gs = GameFlow::Playing;
         menu.toggle(&mut gs);
         assert!(menu.open);
-
-        // Esc while menu is open ONLY closes the menu (does not release mouse or exit)
-        let out1 = menu.handle_escape(&mut gs, true);
-        assert_eq!(out1, EscapeOutcome::ClosedMenu);
+        menu.close(&mut gs);
         assert!(!menu.open);
-        assert_eq!(gs, GameState::Playing);
-
-        // Esc while menu is closed and mouse is captured releases mouse
-        let out2 = menu.handle_escape(&mut gs, true);
-        assert_eq!(out2, EscapeOutcome::ReleaseMouse);
-
-        // Esc while menu is closed and mouse is not captured exits app
-        let out3 = menu.handle_escape(&mut gs, false);
-        assert_eq!(out3, EscapeOutcome::ExitApp);
+        assert_eq!(gs, GameFlow::Playing);
     }
 }

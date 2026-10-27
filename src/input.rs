@@ -7,6 +7,7 @@ pub struct Input {
     pressed: HashSet<KeyCode>,
     just_pressed: HashSet<KeyCode>,
     mouse_delta: (f32, f32),
+    pub cursor_pos: (f32, f32),
     attack_requested: bool,
 }
 
@@ -16,8 +17,13 @@ impl Input {
             pressed: HashSet::with_capacity(16),
             just_pressed: HashSet::with_capacity(8),
             mouse_delta: (0.0, 0.0),
+            cursor_pos: (0.0, 0.0),
             attack_requested: false,
         }
+    }
+
+    pub fn set_cursor_pos(&mut self, x: f32, y: f32) {
+        self.cursor_pos = (x, y);
     }
 
     pub fn handle_key_event(&mut self, event: &KeyEvent) {
