@@ -1,7 +1,9 @@
 use crate::ally::{
     Ally, AllyState, Rarity, AGGRESSIVE_AGGRO_RANGE, ALLY_AGGRO_RANGE, ALLY_ATTACK_RANGE,
-    ALLY_ATTACK_WINDUP, ALLY_CATCHUP_SPEED, ALLY_HEIGHT, ALLY_RADIUS, ALLY_RUN_SPEED,
-    ALLY_WALK_SPEED, FOLLOW_DISTANCE, HOLD_DEFEND_RANGE, MAX_ALLIES, REGROUP_DISTANCE,
+    ALLY_ATTACK_WINDUP, ALLY_CAST_STOP_TIME, ALLY_CATCHUP_SPEED, ALLY_FIREBALL_MAX_DIST,
+    ALLY_FIREBALL_MIN_DIST, ALLY_HEAL_PULSE_AMOUNT, ALLY_HEAL_THRESHOLD_RATIO, ALLY_HEIGHT,
+    ALLY_RADIUS, ALLY_RUN_SPEED, ALLY_WALK_SPEED, EPIC_FIREBALL_COOLDOWN, EPIC_HEAL_COOLDOWN,
+    FOLLOW_DISTANCE, HOLD_DEFEND_RANGE, MAX_ALLIES, RARE_FIREBALL_COOLDOWN, REGROUP_DISTANCE,
     REGROUP_SAFE_DIST, REGROUP_TELEPORT_TIME, REVIVE_HOLD_TIME, REVIVE_RANGE, SLOT_STOP_RADIUS,
     STUCK_TIME_THRESHOLD, SUMMON_COST, SUMMON_SPAWN_OFFSET, TARGET_STICKY_TIME,
 };
@@ -40,7 +42,6 @@ impl SquadMode {
 /// Round-robin A* pathfinding budget scheduler shared fairly between all allies and enemies.
 pub struct AstarBudgetScheduler {
     pub remaining_this_step: usize,
-    pub used_this_step: usize,
     next_cursor: usize,
 }
 
@@ -48,14 +49,12 @@ impl AstarBudgetScheduler {
     pub fn new() -> Self {
         Self {
             remaining_this_step: MAX_SHARED_ASTAR_BUDGET,
-            used_this_step: 0,
             next_cursor: 0,
         }
     }
 
     pub fn begin_step(&mut self) {
         self.remaining_this_step = MAX_SHARED_ASTAR_BUDGET;
-        self.used_this_step = 0;
     }
 
     /// Selects up to `MAX_SHARED_ASTAR_BUDGET` request indices in round-robin order across `requests`.
@@ -77,7 +76,6 @@ impl AstarBudgetScheduler {
             if requests[idx] {
                 out_granted[idx] = true;
                 self.remaining_this_step -= 1;
-                self.used_this_step += 1;
                 self.next_cursor = (idx + 1) % n;
             }
         }
@@ -103,9 +101,17 @@ impl Default for AllyAttackHit {
     }
 }
 
+#[derive(Copy, Clone, Debug)]
+pub enum AllySkillCast {
+    Fireball { origin_xz: Vec2, dir_xz: Vec2 },
+    HealPulse { caster_pos: Vec3, amount: f32 },
+}
+
 pub struct SquadUpdateOutput {
     pub hits: [AllyAttackHit; MAX_ALLIES],
     pub hit_count: usize,
+    pub skill_casts: [Option<AllySkillCast>; MAX_ALLIES],
+    pub skill_cast_count: usize,
     pub revived_ally_pos_and_heal: Option<(Vec3, u32)>,
     pub astar_calls: u32,
     pub astar_micros: u64,
@@ -186,7 +192,9 @@ pub struct Squad {
     next_ally_id: u32,
     name_cursors: [usize; 3],
     pub status_message: String,
+    pub status_color: [f32; 3],
     pub status_timer: f32,
+    pub total_ally_casts: u32,
 }
 
 impl Squad {
@@ -198,7 +206,9 @@ impl Squad {
             next_ally_id: 1,
             name_cursors: [0; 3],
             status_message: String::with_capacity(64),
+            status_color: [1.0, 0.95, 0.45],
             status_timer: 0.0,
+            total_ally_casts: 0,
         }
     }
 
@@ -209,10 +219,12 @@ impl Squad {
         self.next_ally_id = 1;
         self.name_cursors = [0; 3];
         self.status_message.clear();
+        self.status_color = [1.0, 0.95, 0.45];
         self.status_timer = 0.0;
+        self.total_ally_casts = 0;
     }
 
-    pub fn living_count(&self) -> u32 {
+    pub fn _living_count(&self) -> u32 {
         self.allies.iter().filter(|a| a.is_living()).count() as u32
     }
 
@@ -243,8 +255,13 @@ impl Squad {
     }
 
     pub fn set_status_message(&mut self, msg: &str) {
+        self.set_status_message_colored(msg, [1.0, 0.95, 0.45]);
+    }
+
+    pub fn set_status_message_colored(&mut self, msg: &str, color: [f32; 3]) {
         self.status_message.clear();
         self.status_message.push_str(msg);
+        self.status_color = color;
         self.status_timer = STATUS_MESSAGE_DURATION;
     }
 
@@ -302,6 +319,7 @@ impl Squad {
             name,
             rarity.label()
         );
+        self.status_color = rarity.tint();
         self.status_timer = STATUS_MESSAGE_DURATION;
         println!("{}", self.status_message);
         true
@@ -393,6 +411,7 @@ impl Squad {
         dt: f32,
         player_pos: Vec3,
         player_yaw: f32,
+        player_hp_ratio: f32,
         holding_revive_key: bool,
         enemies: &[Enemy],
         actors: &[CombatantInfo],
@@ -404,10 +423,18 @@ impl Squad {
         let mut out = SquadUpdateOutput {
             hits: [AllyAttackHit::default(); MAX_ALLIES],
             hit_count: 0,
+            skill_casts: [None; MAX_ALLIES],
+            skill_cast_count: 0,
             revived_ally_pos_and_heal: None,
             astar_calls: 0,
             astar_micros: 0,
         };
+
+        let any_squad_member_below_half = player_hp_ratio < ALLY_HEAL_THRESHOLD_RATIO
+            || self
+                .allies
+                .iter()
+                .any(|a| a.is_living() && (a.health / a.max_health.max(1.0)) < ALLY_HEAL_THRESHOLD_RATIO);
 
         if self.status_timer > 0.0 {
             self.status_timer = (self.status_timer - dt).max(0.0);
@@ -454,6 +481,8 @@ impl Squad {
             ally.prev_yaw = ally.yaw;
             ally.hit_flash_timer = (ally.hit_flash_timer - dt).max(0.0);
             ally.spawn_fx_timer = (ally.spawn_fx_timer - dt).max(0.0);
+            ally.fireball_cd = (ally.fireball_cd - dt).max(0.0);
+            ally.heal_cd = (ally.heal_cd - dt).max(0.0);
             ally.repath_timer = (ally.repath_timer - dt).max(0.0);
             ally.target_lock_timer += dt;
 
@@ -514,6 +543,65 @@ impl Squad {
             let spd_mult = ally.rarity.speed_mult();
             let mut desired_vel_xz = Vec2::ZERO;
             let mut trying_to_move = false;
+
+            // Rare and Epic ally skill casting in Engage and Attack states
+            if (ally.state == AllyState::Engage || ally.state == AllyState::Attack)
+                && ally.rarity != Rarity::Common
+            {
+                let mut casted = false;
+                // Epic Heal Pulse takes priority when any living squad member is below 50% HP
+                if ally.rarity == Rarity::Epic && ally.heal_cd <= 0.0 && any_squad_member_below_half
+                {
+                    ally.heal_cd = EPIC_HEAL_COOLDOWN;
+                    ally.state = AllyState::Recover;
+                    ally.state_timer = ALLY_CAST_STOP_TIME;
+                    ally.vel = Vec3::ZERO;
+                    if out.skill_cast_count < MAX_ALLIES {
+                        out.skill_casts[out.skill_cast_count] = Some(AllySkillCast::HealPulse {
+                            caster_pos: ally.pos,
+                            amount: ALLY_HEAL_PULSE_AMOUNT,
+                        });
+                        out.skill_cast_count += 1;
+                    }
+                    self.total_ally_casts += 1;
+                    casted = true;
+                }
+
+                if !casted && ally.fireball_cd <= 0.0 {
+                    if let Some(enemy) = enemies
+                        .iter()
+                        .find(|e| Some(e.id) == ally.target_enemy_id && e.is_alive())
+                    {
+                        let to_e = Vec2::new(enemy.pos.x - ally.pos.x, enemy.pos.z - ally.pos.z);
+                        let dist = to_e.length();
+                        if (ALLY_FIREBALL_MIN_DIST..=ALLY_FIREBALL_MAX_DIST).contains(&dist)
+                            && collision.has_line_of_sight(
+                                ally.pos + Vec3::new(0.0, 1.2, 0.0),
+                                enemy.pos + Vec3::new(0.0, 1.1, 0.0),
+                            )
+                        {
+                            let dir = to_e / dist;
+                            ally.yaw = f32::atan2(-dir.x, -dir.y);
+                            ally.fireball_cd = match ally.rarity {
+                                Rarity::Epic => EPIC_FIREBALL_COOLDOWN,
+                                _ => RARE_FIREBALL_COOLDOWN,
+                            };
+                            ally.state = AllyState::Recover;
+                            ally.state_timer = ALLY_CAST_STOP_TIME;
+                            ally.vel = Vec3::ZERO;
+                            if out.skill_cast_count < MAX_ALLIES {
+                                out.skill_casts[out.skill_cast_count] =
+                                    Some(AllySkillCast::Fireball {
+                                        origin_xz: ally_xz + dir * 0.6,
+                                        dir_xz: dir,
+                                    });
+                                out.skill_cast_count += 1;
+                            }
+                            self.total_ally_casts += 1;
+                        }
+                    }
+                }
+            }
 
             match ally.state {
                 AllyState::Regroup => {
@@ -865,51 +953,18 @@ mod tests {
 
         // Hold E for 1.0s within range -> progress increases to 1.0s
         for _ in 0..2 {
-            squad.update(
-                dt,
-                ally_pos,
-                0.0,
-                true,
-                &[],
-                &[],
-                &granted,
-                &grid,
-                &nav,
-                &mut nav_scratch,
-            );
+            squad.update(dt, ally_pos, 0.0, 1.0, true, &[], &[], &granted, &grid, &nav, &mut nav_scratch);
         }
         assert!(squad.allies[0].is_down());
         assert!((squad.allies[0].revive_progress - 1.0).abs() < 1e-4);
 
         // Release E -> progress resets to 0.0
-        squad.update(
-            dt,
-            ally_pos,
-            0.0,
-            false,
-            &[],
-            &[],
-            &granted,
-            &grid,
-            &nav,
-            &mut nav_scratch,
-        );
+        squad.update(dt, ally_pos, 0.0, 1.0, false, &[], &[], &granted, &grid, &nav, &mut nav_scratch);
         assert_eq!(squad.allies[0].revive_progress, 0.0);
 
         // Hold E for full 2.0s within range -> revives with 50% health
         for _ in 0..4 {
-            squad.update(
-                dt,
-                ally_pos,
-                0.0,
-                true,
-                &[],
-                &[],
-                &granted,
-                &grid,
-                &nav,
-                &mut nav_scratch,
-            );
+            squad.update(dt, ally_pos, 0.0, 1.0, true, &[], &[], &granted, &grid, &nav, &mut nav_scratch);
         }
         assert!(squad.allies[0].is_living());
         assert!((squad.allies[0].health - squad.allies[0].max_health * 0.5).abs() < 1e-3);
@@ -937,18 +992,7 @@ mod tests {
         squad.allies[0].regroup_timer = 5.95;
 
         let granted = [false; MAX_ALLIES];
-        squad.update(
-            0.1,
-            Vec3::ZERO,
-            0.0,
-            false,
-            &[],
-            &[],
-            &granted,
-            &grid,
-            &nav,
-            &mut nav_scratch,
-        );
+        squad.update(0.1, Vec3::ZERO, 0.0, 1.0, false, &[], &[], &granted, &grid, &nav, &mut nav_scratch);
         // Teleported next to player (~3.0m formation slot)
         assert!(squad.allies[0].pos.distance(Vec3::ZERO) <= FOLLOW_DISTANCE + 0.5);
         assert_eq!(squad.allies[0].state, AllyState::Follow);
@@ -972,18 +1016,7 @@ mod tests {
         squad.allies[0].pos = Vec3::new(12.0, 0.0, 10.0);
         let granted = [false; MAX_ALLIES];
         for _ in 0..60 {
-            squad.update(
-                1.0 / 60.0,
-                Vec3::ZERO,
-                0.0,
-                false,
-                &[],
-                &[],
-                &granted,
-                &grid,
-                &nav,
-                &mut nav_scratch,
-            );
+            squad.update(1.0 / 60.0, Vec3::ZERO, 0.0, 1.0, false, &[], &[], &granted, &grid, &nav, &mut nav_scratch);
         }
         assert!(squad.allies[0].pos.distance(Vec3::new(10.0, 0.0, 10.0)) < 1.0);
 
@@ -991,19 +1024,46 @@ mod tests {
         squad.set_mode(SquadMode::Aggressive);
         let far_enemy = Enemy::new(9, Vec3::new(10.0, 0.0, -14.0), 1, 1, 0);
         let enemies = vec![far_enemy];
-        squad.update(
-            1.0 / 60.0,
-            Vec3::ZERO,
-            0.0,
-            false,
-            &enemies,
-            &[],
-            &granted,
-            &grid,
-            &nav,
-            &mut nav_scratch,
-        );
+        squad.update(1.0 / 60.0, Vec3::ZERO, 0.0, 1.0, false, &enemies, &[], &granted, &grid, &nav, &mut nav_scratch);
         assert_eq!(squad.allies[0].target_enemy_id, Some(9));
+    }
+
+    #[test]
+    fn test_ally_skill_rules_common_rare_and_epic_heal_priority() {
+        let grid = CollisionGrid::new(Vec::new());
+        let nav = NavGrid::new(&[]);
+        let mut nav_scratch = NavSearchScratch::new();
+        let granted = [false; MAX_ALLIES];
+        let enemies = vec![Enemy::new(1, Vec3::new(0.0, 0.0, -8.0), 1, 1, 0)];
+
+        let mut squad = Squad::new(101);
+        squad.allies.push(Ally::new(1, "CommonOne", Rarity::Common, Vec3::ZERO, 0.0, 1, 0));
+        squad.allies[0].state = AllyState::Engage;
+        squad.allies[0].target_enemy_id = Some(1);
+
+        // Common ally never casts skills
+        let out_c = squad.update(1.0 / 60.0, Vec3::ZERO, 0.0, 0.3, false, &enemies, &[], &granted, &grid, &nav, &mut nav_scratch);
+        assert_eq!(out_c.skill_cast_count, 0);
+
+        // Rare ally casts Fireball when target is between 4m and 14m with LOS
+        squad.allies[0].rarity = Rarity::Rare;
+        squad.allies[0].state = AllyState::Engage;
+        let out_r = squad.update(1.0 / 60.0, Vec3::ZERO, 0.0, 1.0, false, &enemies, &[], &granted, &grid, &nav, &mut nav_scratch);
+        assert_eq!(out_r.skill_cast_count, 1);
+        assert!(matches!(out_r.skill_casts[0], Some(AllySkillCast::Fireball { .. })));
+        assert!((squad.allies[0].fireball_cd - RARE_FIREBALL_COOLDOWN).abs() < 1e-4);
+        assert_eq!(squad.allies[0].state, AllyState::Recover);
+
+        // Epic ally prioritizes Heal Pulse over Fireball when player is below 50% HP (player_hp_ratio = 0.4)
+        squad.allies[0].rarity = Rarity::Epic;
+        squad.allies[0].state = AllyState::Engage;
+        squad.allies[0].fireball_cd = 0.0;
+        squad.allies[0].heal_cd = 0.0;
+        let out_e = squad.update(1.0 / 60.0, Vec3::ZERO, 0.0, 0.4, false, &enemies, &[], &granted, &grid, &nav, &mut nav_scratch);
+        assert_eq!(out_e.skill_cast_count, 1);
+        assert!(matches!(out_e.skill_casts[0], Some(AllySkillCast::HealPulse { .. })));
+        assert!((squad.allies[0].heal_cd - EPIC_HEAL_COOLDOWN).abs() < 1e-4);
+        assert_eq!(squad.allies[0].fireball_cd, 0.0);
     }
 
     #[test]

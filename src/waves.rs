@@ -36,11 +36,6 @@ impl WaveManager {
     }
 
     #[inline]
-    pub fn enemies_for_wave(wave: u32) -> u32 {
-        Self::enemies_for_wave_with_allies(wave, 0)
-    }
-
-    #[inline]
     pub fn enemies_for_wave_with_allies(wave: u32, living_allies: u32) -> u32 {
         WAVE_1_ENEMIES + wave.saturating_sub(1) * WAVE_INCREMENT + living_allies
     }
@@ -165,8 +160,8 @@ mod tests {
 
     #[test]
     fn test_wave_spawn_count_progression_with_living_allies() {
-        assert_eq!(WaveManager::enemies_for_wave(1), 3);
-        assert_eq!(WaveManager::enemies_for_wave(2), 5);
+        assert_eq!(WaveManager::enemies_for_wave_with_allies(1, 0), 3);
+        assert_eq!(WaveManager::enemies_for_wave_with_allies(2, 0), 5);
         assert_eq!(WaveManager::enemies_for_wave_with_allies(1, 2), 5);
         assert_eq!(WaveManager::enemies_for_wave_with_allies(3, 4), 11);
     }

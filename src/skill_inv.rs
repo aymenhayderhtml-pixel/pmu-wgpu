@@ -47,6 +47,7 @@ pub struct SkillHudSlot {
     pub skill: Option<SkillId>,
     pub level: u8,
     pub cooldown_ratio: f32,
+    pub cooldown_remaining: f32,
     pub fail_flash: f32,
 }
 
@@ -249,6 +250,7 @@ impl SkillInventory {
             skill: None,
             level: 0,
             cooldown_ratio: 0.0,
+            cooldown_remaining: 0.0,
             fail_flash: 0.0,
         }; SLOT_COUNT];
 
@@ -259,6 +261,7 @@ impl SkillInventory {
                     skill: Some(sk),
                     level: self.level(sk),
                     cooldown_ratio: (self.cooldowns[i] / cd_max).clamp(0.0, 1.0),
+                    cooldown_remaining: self.cooldowns[i],
                     fail_flash: (self.fail_flash[i] / 0.35).clamp(0.0, 1.0),
                 };
             } else {

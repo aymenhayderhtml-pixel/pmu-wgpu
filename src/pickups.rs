@@ -157,6 +157,20 @@ impl PickupManager {
                     color: [t[0], t[1], t[2], 1.5],
                 });
             }
+
+            // Thin tall beacon beam above each orb so it is visible from afar
+            let beam_model = Mat4::from_scale_rotation_translation(
+                Vec3::new(0.10, 3.2, 0.10),
+                Quat::IDENTITY,
+                Vec3::new(orb.pos.x, 1.6, orb.pos.z),
+            );
+            if frustum.intersects_local_aabb(beam_model, cube_min, cube_max) {
+                let t = orb.skill.def().tint;
+                out.push(InstanceData {
+                    model: beam_model,
+                    color: [t[0], t[1], t[2], 1.75],
+                });
+            }
         }
     }
 }

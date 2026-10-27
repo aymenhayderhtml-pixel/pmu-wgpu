@@ -46,7 +46,6 @@ pub struct CombatantInfo {
     pub pos: Vec3,
     pub active: bool,
     pub sprinting: bool,
-    pub attacking_player_side: bool,
 }
 
 /// Shared separation steering force away from all active actors within `sep_radius`.

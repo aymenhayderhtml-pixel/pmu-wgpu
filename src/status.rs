@@ -28,11 +28,11 @@ impl StatusEffects {
         }
     }
 
-    pub fn is_burning(&self) -> bool {
+    pub fn _is_burning(&self) -> bool {
         self.burn_timer > 0.0
     }
 
-    pub fn is_slowed(&self) -> bool {
+    pub fn _is_slowed(&self) -> bool {
         self.slow_timer > 0.0
     }
 
@@ -101,8 +101,8 @@ mod tests {
 
         st.apply_burn(BURN_DURATION);
         st.apply_slow(SLOW_DURATION);
-        assert!(st.is_burning());
-        assert!(st.is_slowed());
+        assert!(st._is_burning());
+        assert!(st._is_slowed());
         assert!((st.speed_multiplier() - SLOW_MULTIPLIER).abs() < 1e-5);
 
         // Tick 1.0s: 4.0 burn damage and 1 popup of 4
@@ -119,8 +119,8 @@ mod tests {
         for _ in 0..3 {
             let _ = st.update(1.0);
         }
-        assert!(!st.is_burning());
-        assert!(!st.is_slowed());
+        assert!(!st._is_burning());
+        assert!(!st._is_slowed());
         assert_eq!(st.speed_multiplier(), 1.0);
     }
 }

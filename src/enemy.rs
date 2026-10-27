@@ -32,7 +32,7 @@ pub const SEPARATION_RADIUS: f32 = 1.2;
 pub const SEPARATION_WEIGHT: f32 = 3.5;
 pub const REPATH_INTERVAL: f32 = 0.50;
 pub const REPATH_TARGET_DRIFT: f32 = 3.0;
-pub const MAX_ASTAR_PER_STEP: usize = 2;
+pub const _MAX_ASTAR_PER_STEP: usize = 2;
 
 pub const DEATH_FALL_DURATION: f32 = 0.50;
 pub const DEATH_SINK_DURATION: f32 = 1.50;
@@ -138,6 +138,7 @@ impl Enemy {
         self.state == EnemyState::Dead && self.death_timer >= DEATH_TOTAL_DURATION
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn apply_hit(&mut self, damage: f32, attacker_pos: Vec3) -> bool {
         self.apply_hit_from(damage, attacker_pos, ActorId::Player)
     }

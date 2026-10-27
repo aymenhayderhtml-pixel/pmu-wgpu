@@ -37,6 +37,16 @@ pub const TARGET_STICKY_TIME: f32 = 1.5;
 pub const REVIVE_HOLD_TIME: f32 = 2.0;
 pub const REVIVE_RANGE: f32 = 2.5;
 
+pub const RARE_FIREBALL_COOLDOWN: f32 = 6.0;
+pub const EPIC_FIREBALL_COOLDOWN: f32 = 5.0;
+pub const EPIC_HEAL_COOLDOWN: f32 = 10.0;
+pub const ALLY_FIREBALL_MIN_DIST: f32 = 4.0;
+pub const ALLY_FIREBALL_MAX_DIST: f32 = 14.0;
+pub const ALLY_HEAL_PULSE_AMOUNT: f32 = 20.0;
+pub const ALLY_HEAL_PULSE_RADIUS: f32 = 8.0;
+pub const ALLY_HEAL_THRESHOLD_RATIO: f32 = 0.50;
+pub const ALLY_CAST_STOP_TIME: f32 = 0.30;
+
 pub const COMMON_NAMES: [&str; 6] = ["Rowan", "Pip", "Bram", "Kael", "Finn", "Toma"];
 pub const RARE_NAMES: [&str; 6] = ["Lyra", "Vane", "Soren", "Freya", "Caelum", "Nyx"];
 pub const EPIC_NAMES: [&str; 6] = ["Aurelia", "Zephyr", "Valerius", "Seraphina", "Orion", "Isolde"];
@@ -164,6 +174,8 @@ pub struct Ally {
     pub revive_progress: f32,
     pub spawn_fx_timer: f32,
     pub hit_flash_timer: f32,
+    pub fireball_cd: f32,
+    pub heal_cd: f32,
     pub repath_timer: f32,
     pub path: Vec<Vec2>,
     pub path_index: usize,
@@ -212,6 +224,8 @@ impl Ally {
             revive_progress: 0.0,
             spawn_fx_timer: ALLY_SPAWN_FX_DURATION,
             hit_flash_timer: 0.0,
+            fireball_cd: 0.0,
+            heal_cd: 0.0,
             repath_timer: 0.0,
             path: Vec::with_capacity(64),
             path_index: 0,

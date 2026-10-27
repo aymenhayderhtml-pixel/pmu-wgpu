@@ -3,34 +3,50 @@ use crate::ally::MAX_ALLIES;
 use crate::animation::{AnimationClip, Skeleton};
 use crate::camera::{lerp_angle, Camera};
 use crate::collision::{Aabb, CollisionGrid};
+use crate::ally::ALLY_HEAL_PULSE_RADIUS;
 use crate::combat::{
     is_in_attack_arc, ActorId, CombatantInfo, Faction, FloatingKind, FloatingNumberPool,
-    PlayerCombat, SWING_ARC_RAD, SWING_DAMAGE, SWING_RANGE, SWING_SPEED_MULT,
+    PlayerCombat, PLAYER_MAX_HEALTH, SWING_ARC_RAD, SWING_DAMAGE, SWING_RANGE, SWING_SPEED_MULT,
 };
+use crate::effects::EffectsPool;
 use crate::enemy::{Enemy, EnemyState};
 use crate::frustum::Frustum;
 use crate::input::Input;
 use crate::nav::{NavGrid, NavSearchScratch};
 use crate::pickups::PickupManager;
 use crate::player_anim::{AnimMode, ClipMap, PlayerAnimator};
-use crate::projectiles::{
-    apply_skill_hit_to_enemy, ProjectileManager, SkillDamageHit,
-};
+use crate::projectiles::{apply_skill_hit_to_enemy, ProjectileManager, SkillDamageHit};
 use crate::skill_inv::{PickupOutcome, SkillInventory};
+use crate::skill_menu::{GameState, MenuState};
 use crate::skills::{
-    compute_aim_direction_xz, level_multiplier, SkillKind, CAST_SPEED_MULT,
+    compute_aim_direction_xz, level_multiplier, SkillId, SkillKind, CAST_SPEED_MULT,
 };
-use crate::squad::{AstarBudgetScheduler, Squad, SquadMode};
+use crate::squad::{AllySkillCast, AstarBudgetScheduler, Squad, SquadMode};
 use crate::waves::{WaveManager, MAX_ALIVE_ENEMIES};
 use glam::{Mat4, Quat, Vec2, Vec3};
 use std::fmt::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
 use winit::keyboard::KeyCode;
 
 pub const MODEL_YAW_OFFSET: f32 = std::f32::consts::PI;
 
 pub const GROUND_SIZE: f32 = 60.0;
 pub const STATIC_CUBE_COUNT: usize = 300;
-pub const TOTAL_CUBE_INSTANCES: usize = 600;
+pub const TOTAL_CUBE_INSTANCES: usize = 1024;
+
+static CUBE_OVERFLOW_WARNED: AtomicBool = AtomicBool::new(false);
+
+#[inline]
+pub fn push_cube_instance_guarded(out: &mut Vec<InstanceData>, inst: InstanceData) {
+    if out.len() < TOTAL_CUBE_INSTANCES {
+        out.push(inst);
+    } else if !CUBE_OVERFLOW_WARNED.swap(true, Ordering::Relaxed) {
+        eprintln!(
+            "Warning: cube instance count reached TOTAL_CUBE_INSTANCES ({}); dropping lowest-priority visual effect instances",
+            TOTAL_CUBE_INSTANCES
+        );
+    }
+}
 pub const PROP_MAX_INSTANCES: usize = 50;
 
 pub const PLAYER_RADIUS: f32 = 0.4;
@@ -144,7 +160,10 @@ pub struct World {
     pub enemies: Vec<Enemy>,
     pub waves: WaveManager,
     pub skill_inv: SkillInventory,
+    pub menu: MenuState,
+    pub game_state: GameState,
     pub projectiles: ProjectileManager,
+    pub effects: EffectsPool,
     pub pickups: PickupManager,
     pub floating_numbers: FloatingNumberPool,
     pub debug_draw_enabled: bool,
@@ -262,7 +281,10 @@ impl World {
             enemies: Vec::with_capacity(MAX_ALIVE_ENEMIES),
             waves: WaveManager::new(WORLD_SEED),
             skill_inv: SkillInventory::new(),
+            menu: MenuState::new(),
+            game_state: GameState::Playing,
             projectiles: ProjectileManager::new(),
+            effects: EffectsPool::new(),
             pickups: PickupManager::new(WORLD_SEED),
             floating_numbers: FloatingNumberPool::new(),
             debug_draw_enabled: false,
@@ -309,7 +331,9 @@ impl World {
         self.enemies.clear();
         self.waves.reset(WORLD_SEED);
         self.skill_inv.reset();
+        self.menu.close(&mut self.game_state);
         self.projectiles.clear();
+        self.effects.clear();
         self.pickups.reset(WORLD_SEED);
         self.floating_numbers.clear();
 
@@ -350,7 +374,20 @@ impl World {
             Ok((a, b, res)) => {
                 let mut msg = String::with_capacity(64);
                 let _ = write!(&mut msg, "FUSED: {} + {} = {}", a.def().name, b.def().name, res.def().name);
-                self.squad.set_status_message(&msg);
+                self.squad.set_status_message_colored(&msg, res.def().tint);
+            }
+            Err(err_msg) => {
+                self.squad.set_status_message(err_msg);
+            }
+        }
+    }
+
+    pub fn try_fuse_selected_menu_recipe(&mut self) {
+        match self.menu.try_fuse_selected_recipe(&mut self.skill_inv) {
+            Ok((a, b, res)) => {
+                let mut msg = String::with_capacity(64);
+                let _ = write!(&mut msg, "FUSED: {} + {} = {}", a.def().name, b.def().name, res.def().name);
+                self.squad.set_status_message_colored(&msg, res.def().tint);
             }
             Err(err_msg) => {
                 self.squad.set_status_message(err_msg);
@@ -384,31 +421,12 @@ impl World {
                 self.projectiles.spawn_projectile(origin_xz, aim_dir, skill, level, pierce);
             }
             SkillKind::HealPulse => {
-                let heal_amt = scaled_power;
-                self.combat.health = (self.combat.health + heal_amt).min(crate::combat::PLAYER_MAX_HEALTH);
-                self.floating_numbers.spawn_kind(
-                    self.player.pos + Vec3::new(0.0, 2.2, 0.0),
-                    heal_amt.round() as u32,
-                    FloatingKind::Heal,
-                );
-                let p_xz = Vec2::new(self.player.pos.x, self.player.pos.z);
-                for ally in &mut self.squad.allies {
-                    if ally.is_living()
-                        && Vec2::new(ally.pos.x, ally.pos.z).distance(p_xz) <= def.radius
-                    {
-                        ally.health = (ally.health + heal_amt).min(ally.max_health);
-                        self.floating_numbers.spawn_kind(
-                            ally.pos + Vec3::new(0.0, 2.2, 0.0),
-                            heal_amt.round() as u32,
-                            FloatingKind::Heal,
-                        );
-                    }
-                }
-                self.projectiles.spawn_flash(self.player.pos + Vec3::new(0.0, 0.5, 0.0), def.radius * 0.5, def.tint);
+                self.apply_squad_heal_pulse(self.player.pos, def.radius, scaled_power);
+                self.effects.spawn_ring(self.player.pos, def.radius, 0.45, def.tint);
             }
             SkillKind::Shockwave { knockback } => {
                 self.apply_aoe_around_player(scaled_power, def.radius, knockback);
-                self.projectiles.spawn_flash(self.player.pos + Vec3::new(0.0, 0.4, 0.0), def.radius, def.tint);
+                self.effects.spawn_ring(self.player.pos, def.radius, 0.40, def.tint);
             }
             SkillKind::Dash { leaves_slow_zone } => {
                 self.skill_inv.dash_timer = def.duration;
@@ -418,6 +436,7 @@ impl World {
                 self.combat.skill_invuln_timer = def.duration;
                 if leaves_slow_zone {
                     self.projectiles.spawn_slow_zone(self.player.pos);
+                    self.effects.spawn_ring(self.player.pos, 2.5, 2.0, def.tint);
                 }
             }
             SkillKind::Meteor { mark_dist, delay, knockback } => {
@@ -431,31 +450,33 @@ impl World {
                     knockback,
                     &self.collision,
                 );
+                if let Some(m) = self.projectiles.meteors.iter().find(|m| m.active && (m.timer - delay).abs() < 1e-4) {
+                    self.effects.spawn_meteor_telegraph(m.pos, def.radius, delay, def.tint);
+                }
             }
             SkillKind::HolyNova { heal_radius, enemy_damage, enemy_radius, knockback } => {
-                let heal_amt = scaled_power;
-                self.combat.health = (self.combat.health + heal_amt).min(crate::combat::PLAYER_MAX_HEALTH);
-                self.floating_numbers.spawn_kind(
-                    self.player.pos + Vec3::new(0.0, 2.2, 0.0),
-                    heal_amt.round() as u32,
-                    FloatingKind::Heal,
-                );
-                let p_xz = Vec2::new(self.player.pos.x, self.player.pos.z);
-                for ally in &mut self.squad.allies {
-                    if ally.is_living() && Vec2::new(ally.pos.x, ally.pos.z).distance(p_xz) <= heal_radius {
-                        ally.health = (ally.health + heal_amt).min(ally.max_health);
-                        self.floating_numbers.spawn_kind(
-                            ally.pos + Vec3::new(0.0, 2.2, 0.0),
-                            heal_amt.round() as u32,
-                            FloatingKind::Heal,
-                        );
-                    }
-                }
+                self.apply_squad_heal_pulse(self.player.pos, heal_radius, scaled_power);
                 self.apply_aoe_around_player(enemy_damage * mult, enemy_radius, knockback);
-                self.projectiles.spawn_flash(self.player.pos + Vec3::new(0.0, 0.5, 0.0), enemy_radius, def.tint);
+                self.effects.spawn_ring(self.player.pos, enemy_radius, 0.50, def.tint);
             }
         }
         true
+    }
+
+    fn apply_squad_heal_pulse(&mut self, center_pos: Vec3, radius: f32, heal_amt: f32) {
+        let c_xz = Vec2::new(center_pos.x, center_pos.z);
+        if !self.combat.is_dead() && Vec2::new(self.player.pos.x, self.player.pos.z).distance(c_xz) <= radius {
+            self.combat.health = (self.combat.health + heal_amt).min(PLAYER_MAX_HEALTH);
+            self.floating_numbers.spawn_kind(self.player.pos + Vec3::new(0.0, 2.2, 0.0), heal_amt.round() as u32, FloatingKind::Heal);
+            self.effects.spawn_heal_particles(self.player.pos);
+        }
+        for ally in &mut self.squad.allies {
+            if ally.is_living() && Vec2::new(ally.pos.x, ally.pos.z).distance(c_xz) <= radius {
+                ally.health = (ally.health + heal_amt).min(ally.max_health);
+                self.floating_numbers.spawn_kind(ally.pos + Vec3::new(0.0, 2.2, 0.0), heal_amt.round() as u32, FloatingKind::Heal);
+                self.effects.spawn_heal_particles(ally.pos);
+            }
+        }
     }
 
     fn apply_aoe_around_player(&mut self, damage: f32, radius: f32, knockback: f32) {
@@ -560,6 +581,13 @@ impl World {
         self.player.interpolated_gltf_model(alpha, self.model_yaw_offset, proc_local)
     }
 
+    pub fn step_if_unpaused(&mut self, input: &mut Input, camera: &Camera, dt: f32) -> Option<AiStepStats> {
+        if self.game_state.is_paused() {
+            return None;
+        }
+        Some(self.update(input, camera, dt))
+    }
+
     pub fn update(&mut self, input: &mut Input, camera: &Camera, dt: f32) -> AiStepStats {
         self.player.prev_pos = self.player.pos;
         self.player.prev_yaw = self.player.yaw;
@@ -607,6 +635,7 @@ impl World {
                     if self.skill_inv.slow_drop_accum >= 0.06 {
                         self.skill_inv.slow_drop_accum = 0.0;
                         self.projectiles.spawn_slow_zone(self.player.pos);
+                        self.effects.spawn_ring(self.player.pos, 2.5, 0.35, SkillId::FrostDash.def().tint);
                     }
                 }
             } else if let Some(dodge_vel) = self.combat.dodge_velocity_xz() {
@@ -758,7 +787,6 @@ impl World {
             pos: self.player.pos,
             active: !self.combat.is_dead(),
             sprinting,
-            attacking_player_side: false,
         });
         for ally in &self.squad.allies {
             self.combatant_scratch.push(CombatantInfo {
@@ -767,7 +795,6 @@ impl World {
                 pos: ally.pos,
                 active: ally.is_living(),
                 sprinting: false,
-                attacking_player_side: false,
             });
         }
         for enemy in &self.enemies {
@@ -777,7 +804,6 @@ impl World {
                 pos: enemy.pos,
                 active: enemy.is_alive(),
                 sprinting: false,
-                attacking_player_side: enemy.state == EnemyState::Attack || enemy.state == EnemyState::Chase,
             });
         }
 
@@ -801,10 +827,12 @@ impl World {
         enemy_granted.copy_from_slice(&combined_granted[MAX_ALLIES..]);
 
         let holding_revive = !self.combat.is_dead() && input.is_pressed(KeyCode::KeyE);
+        let player_hp_ratio = self.combat.health / PLAYER_MAX_HEALTH.max(1.0);
         let squad_out = self.squad.update(
             dt,
             self.player.pos,
             self.player.yaw,
+            player_hp_ratio,
             holding_revive,
             &self.enemies,
             &self.combatant_scratch,
@@ -816,6 +844,22 @@ impl World {
 
         if let Some((rev_pos, heal_amt)) = squad_out.revived_ally_pos_and_heal {
             self.floating_numbers.spawn_kind(rev_pos + Vec3::new(0.0, 2.2, 0.0), heal_amt, FloatingKind::Heal);
+            self.effects.spawn_heal_particles(rev_pos);
+        }
+
+        // Execute Rare/Epic ally skill casts (Fireball or Heal Pulse)
+        for i in 0..squad_out.skill_cast_count {
+            if let Some(cast) = squad_out.skill_casts[i] {
+                match cast {
+                    AllySkillCast::Fireball { origin_xz, dir_xz } => {
+                        self.projectiles.spawn_projectile(origin_xz, dir_xz, SkillId::Fireball, 1, 0);
+                    }
+                    AllySkillCast::HealPulse { caster_pos, amount } => {
+                        self.apply_squad_heal_pulse(caster_pos, ALLY_HEAL_PULSE_RADIUS, amount);
+                        self.effects.spawn_ring(caster_pos, ALLY_HEAL_PULSE_RADIUS, 0.45, SkillId::HealPulse.def().tint);
+                    }
+                }
+            }
         }
 
         for i in 0..squad_out.hit_count {
@@ -869,20 +913,26 @@ impl World {
             &mut self.skill_inv,
         ) {
             let mut msg = String::with_capacity(64);
-            match outcome {
+            let sk = match outcome {
                 PickupOutcome::Unlocked { skill, .. } => {
-                    let _ = write!(&mut msg, "Unlocked: {}", skill.def().name);
+                    let _ = write!(&mut msg, "Picked up: {}", skill.def().name);
+                    skill
                 }
                 PickupOutcome::LeveledUp { skill, new_level } => {
                     let _ = write!(&mut msg, "{} level {}", skill.def().name, new_level);
+                    skill
                 }
                 PickupOutcome::ExtraCopy { skill, count } => {
-                    let _ = write!(&mut msg, "{} copy ({})", skill.def().name, count);
+                    let _ = write!(&mut msg, "Picked up: {} (x{})", skill.def().name, count);
+                    skill
                 }
-            }
-            self.squad.set_status_message(&msg);
+            };
+            let tc = sk.def().tint;
+            self.squad.set_status_message_colored(&msg, tc);
+            self.effects.spawn_pickup_sparkle(self.player.pos, tc);
         }
 
+        self.effects.update(dt);
         self.floating_numbers.update(dt);
 
         let total_allies_once_revived = self.squad.allies.len() as u32;
@@ -902,6 +952,7 @@ impl World {
         if new_wave_started {
             for (r_pos, heal_amt) in self.squad.revive_all_down_for_new_wave() {
                 self.floating_numbers.spawn_kind(r_pos + Vec3::new(0.0, 2.2, 0.0), heal_amt, FloatingKind::Heal);
+                self.effects.spawn_heal_particles(r_pos);
             }
         }
 
@@ -961,6 +1012,12 @@ impl World {
 
         self.projectiles.append_visible_cube_instances(frustum, out);
         self.pickups.append_visible_cube_instances(frustum, out);
+        if out.len() > TOTAL_CUBE_INSTANCES {
+            out.truncate(TOTAL_CUBE_INSTANCES);
+        }
+        self.effects.append_visible_cube_instances(frustum, |inst| {
+            push_cube_instance_guarded(out, inst);
+        });
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1094,7 +1151,10 @@ mod tests {
             enemies: Vec::new(),
             waves: WaveManager::new(WORLD_SEED),
             skill_inv: SkillInventory::new(),
+            menu: MenuState::new(),
+            game_state: GameState::Playing,
             projectiles: ProjectileManager::new(),
+            effects: EffectsPool::new(),
             pickups: PickupManager::new(WORLD_SEED),
             floating_numbers: FloatingNumberPool::new(),
             debug_draw_enabled: false,
@@ -1343,5 +1403,85 @@ mod tests {
             world.waves.score >= 10 || world.alive_enemy_count() < 3,
             "at least one enemy must die from Fireball casts within 900 steps"
         );
+    }
+
+    #[test]
+    fn test_pause_check_blocks_fixed_update_and_instance_writer_guard() {
+        let mut world = test_world_with_single_cube(Aabb {
+            min: Vec3::new(10.0, 0.0, 10.0),
+            max: Vec3::new(11.0, 1.0, 11.0),
+        });
+        world.waves.pending_spawns = 0;
+        world.player.vel = Vec3::new(5.0, 0.0, 0.0);
+
+        let mut input = Input::new();
+        let camera = Camera::new(Vec3::ZERO, 16.0 / 9.0);
+
+        // Open menu -> GameState becomes Paused -> step_if_unpaused does not advance simulation
+        world.menu.toggle(&mut world.game_state);
+        assert!(world.game_state.is_paused());
+        assert!(world.step_if_unpaused(&mut input, &camera, 1.0 / 60.0).is_none());
+        assert_eq!(world.player.pos.x, 0.0);
+
+        // Close menu -> GameState becomes Playing -> step_if_unpaused advances simulation
+        world.menu.toggle(&mut world.game_state);
+        assert!(!world.game_state.is_paused());
+        assert!(world.step_if_unpaused(&mut input, &camera, 1.0 / 60.0).is_some());
+        assert!(world.player.pos.x > 0.0);
+
+        // Test instance writer guard never exceeds TOTAL_CUBE_INSTANCES
+        let mut buf = Vec::with_capacity(TOTAL_CUBE_INSTANCES);
+        for _ in 0..(TOTAL_CUBE_INSTANCES + 50) {
+            push_cube_instance_guarded(
+                &mut buf,
+                InstanceData {
+                    model: Mat4::IDENTITY,
+                    color: [1.0, 1.0, 1.0, 1.0],
+                },
+            );
+        }
+        assert_eq!(buf.len(), TOTAL_CUBE_INSTANCES);
+    }
+
+    #[test]
+    fn test_deterministic_900_step_epic_ally_skill_simulation() {
+        let mut world = World::new(None, None, None, None, None, Vec::new(), None, Vec::new(), None, Vec::new());
+        assert_eq!(world.enemies.len(), 3);
+
+        // Spawn 1 Epic ally near the stationary player and place 3 enemies within 10m
+        let mut epic_ally = crate::ally::Ally::new(
+            1,
+            "Aurelia",
+            crate::ally::Rarity::Epic,
+            Vec3::new(1.5, 0.0, 0.0),
+            0.0,
+            1,
+            0,
+        );
+        epic_ally.state = crate::ally::AllyState::Engage;
+        world.squad.allies.push(epic_ally);
+
+        world.enemies[0].pos = Vec3::new(0.0, 0.0, -9.0);
+        world.enemies[1].pos = Vec3::new(2.0, 0.0, -10.0);
+        world.enemies[2].pos = Vec3::new(-2.0, 0.0, -11.0);
+        for e in &mut world.enemies {
+            e.state = EnemyState::Chase;
+        }
+        let initial_enemy_hp: f32 = world.enemies.iter().map(|e| e.health).sum();
+
+        let mut input = Input::new();
+        let camera = Camera::new(world.player.pos, 16.0 / 9.0);
+        let dt = 1.0 / 60.0;
+
+        for _ in 0..900 {
+            world.update(&mut input, &camera, dt);
+            assert!(world.projectiles.active_projectile_count() as usize <= crate::projectiles::MAX_PROJECTILES);
+            assert!(world.effects.active_count() as usize <= crate::effects::MAX_EFFECT_ENTRIES);
+            assert!(world.pickups.active_orb_count() as usize <= crate::pickups::MAX_SKILL_ORBS);
+        }
+
+        let final_enemy_hp: f32 = world.enemies.iter().filter(|e| e.is_alive()).map(|e| e.health).sum();
+        assert!(world.squad.total_ally_casts >= 1, "Epic ally must cast at least once");
+        assert!(final_enemy_hp < initial_enemy_hp || world.waves.score > 0, "enemies must take damage");
     }
 }

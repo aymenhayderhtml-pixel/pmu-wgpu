@@ -14,7 +14,7 @@ pub const MAX_HUD_QUADS: usize = 4096;
 pub const MAX_HUD_VERTICES: usize = MAX_HUD_QUADS * 6;
 
 const CONTROLS_HINT: &str =
-    "LClick:Atk Q/F/X/V:Skills T:Fuse C:Dodge G:Summon E:Rev 1/2/3:Squad R:Reset F1..F8:Tools";
+    "LClick:Atk Q/F/X/V:Skills K:Menu T:Fuse C:Dodge G:Summon E:Rev 1/2/3:Squad R:Reset";
 const DEATH_MESSAGE: &str = "YOU DIED - press R to restart";
 
 #[repr(C)]
@@ -315,7 +315,7 @@ impl HudRenderer {
             push_solid_quad(&mut self.vertex_scratch, bx - 2.0, mp_y - 2.0, hp_w + 4.0, mp_h + 4.0, [0.02, 0.03, 0.05, 0.85]);
             push_solid_quad(&mut self.vertex_scratch, bx, mp_y, hp_w * mp_ratio, mp_h, [0.22, 0.56, 0.98, 0.95]);
             self.text_scratch.clear();
-            let _ = write!(&mut self.text_scratch, "MP {:3.0}/{:3.0}", telemetry.skills.mana.floor(), telemetry.skills.max_mana);
+            let _ = write!(&mut self.text_scratch, "MP {:.0}/{:.0}", telemetry.skills.mana.floor(), telemetry.skills.max_mana);
             let mp_text_w = (self.text_scratch.len() as f32) * 10.0;
             push_text_line(&mut self.vertex_scratch, &self.text_scratch, bx + (hp_w - mp_text_w) * 0.5, mp_y + 2.0, 10.0, [1.0, 1.0, 1.0, 1.0]);
 
@@ -338,19 +338,26 @@ impl HudRenderer {
 
                 if let Some(sk) = slot_info.skill {
                     let def = sk.def();
-                    push_text_line(&mut self.vertex_scratch, def.short_name, sx + 5.0, slots_y + 16.0, 10.0, [def.tint[0], def.tint[1], def.tint[2], 1.0]);
+                    // Colored inner square in the skill color + big first letter in the center
+                    push_solid_quad(&mut self.vertex_scratch, sx + 8.0, slots_y + 10.0, slot_w - 16.0, slot_h - 16.0, [def.tint[0] * 0.45, def.tint[1] * 0.45, def.tint[2] * 0.45, 0.90]);
+                    let first_letter = &def.name[0..1];
+                    push_text_line(&mut self.vertex_scratch, first_letter, sx + 16.0, slots_y + 15.0, 18.0, [def.tint[0], def.tint[1], def.tint[2], 1.0]);
+
                     self.text_scratch.clear();
                     let _ = write!(&mut self.text_scratch, "L{}", slot_info.level);
-                    push_text_line(&mut self.vertex_scratch, &self.text_scratch, sx + slot_w - 20.0, slots_y + 4.0, 9.0, [0.95, 0.90, 0.45, 1.0]);
+                    push_text_line(&mut self.vertex_scratch, &self.text_scratch, sx + slot_w - 20.0, slots_y + 3.0, 9.0, [0.95, 0.90, 0.45, 1.0]);
 
                     if slot_info.cooldown_ratio > 0.0 {
                         let cd_h = slot_h * slot_info.cooldown_ratio;
-                        push_solid_quad(&mut self.vertex_scratch, sx, slots_y, slot_w, cd_h, [0.01, 0.01, 0.02, 0.76]);
+                        push_solid_quad(&mut self.vertex_scratch, sx, slots_y, slot_w, cd_h, [0.01, 0.01, 0.02, 0.78]);
+                        self.text_scratch.clear();
+                        let _ = write!(&mut self.text_scratch, "{:.1}", slot_info.cooldown_remaining);
+                        push_text_line(&mut self.vertex_scratch, &self.text_scratch, sx + 10.0, slots_y + 18.0, 10.0, [1.0, 0.95, 0.85, 1.0]);
                     }
                 } else {
                     push_text_line(&mut self.vertex_scratch, "--", sx + 16.0, slots_y + 18.0, 10.0, [0.45, 0.48, 0.52, 0.9]);
                 }
-                push_text_line(&mut self.vertex_scratch, key_label, sx + 4.0, slots_y + 4.0, 10.0, [0.85, 0.90, 1.0, 1.0]);
+                push_text_line(&mut self.vertex_scratch, key_label, sx + 3.0, slots_y + 3.0, 9.5, [0.85, 0.90, 1.0, 1.0]);
             }
 
             let hp_ratio = (telemetry.player_health / telemetry.player_max_health.max(1.0)).clamp(0.0, 1.0);
@@ -461,8 +468,9 @@ impl HudRenderer {
             self.text_scratch.clear();
             let _ = write!(
                 &mut self.text_scratch,
-                "MP:{:.0} Prj:{} Fx:{} Orb:{} Inv[{}{}{}{}{}|{}{}{}{}]",
-                telemetry.skills.mana,
+                "St:{} AlCast:{} Prj:{} Fx:{} Orb:{} Inv[{}{}{}{}{}|{}{}{}{}]",
+                telemetry.game_state.label(),
+                telemetry.ally_casts,
                 telemetry.skills.active_projectiles,
                 telemetry.skills.active_effects,
                 telemetry.skills.active_orbs,

@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 mod ai;
 mod ally;
 mod animation;
@@ -7,6 +6,7 @@ mod camera;
 mod collision;
 mod combat;
 mod debug_lines;
+mod effects;
 mod enemy;
 mod font;
 mod frustum;
@@ -25,6 +25,7 @@ mod projectiles;
 mod renderer;
 mod shadow;
 mod skill_inv;
+mod skill_menu;
 mod skills;
 mod sky;
 mod squad;

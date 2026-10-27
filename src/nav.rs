@@ -111,6 +111,7 @@ impl NavGrid {
     }
 
     #[inline]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn set_blocked(&mut self, cx: usize, cz: usize, is_blocked: bool) {
         if cx < NAV_GRID_DIM && cz < NAV_GRID_DIM {
             self.blocked[cz * NAV_GRID_DIM + cx] = is_blocked;

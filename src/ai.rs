@@ -499,7 +499,6 @@ mod tests {
                 pos: Vec3::new(0.0, 0.0, -10.0),
                 active: true,
                 sprinting: false,
-                attacking_player_side: false,
             },
             CombatantInfo {
                 id: ActorId::Ally(1),
@@ -507,7 +506,6 @@ mod tests {
                 pos: Vec3::new(0.0, 0.0, -4.0),
                 active: true,
                 sprinting: false,
-                attacking_player_side: false,
             },
         ];
 

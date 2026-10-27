@@ -510,6 +510,9 @@ impl Renderer {
             for inst in &self.cpu_instance_scratch {
                 self.gpu_instance_scratch.push(InstanceRaw { model: inst.model.to_cols_array_2d(), color: inst.color });
             }
+            if self.gpu_instance_scratch.len() > TOTAL_CUBE_INSTANCES {
+                self.gpu_instance_scratch.truncate(TOTAL_CUBE_INSTANCES);
+            }
             shadow_cube_count = self.gpu_instance_scratch.len() as u32;
             if shadow_cube_count > 0 {
                 self.queue.write_buffer(&self.cube_shadow_instance_buffer, 0, bytemuck::cast_slice(&self.gpu_instance_scratch));
@@ -546,6 +549,9 @@ impl Renderer {
         self.gpu_instance_scratch.clear();
         for inst in &self.cpu_instance_scratch {
             self.gpu_instance_scratch.push(InstanceRaw { model: inst.model.to_cols_array_2d(), color: inst.color });
+        }
+        if self.gpu_instance_scratch.len() > TOTAL_CUBE_INSTANCES {
+            self.gpu_instance_scratch.truncate(TOTAL_CUBE_INSTANCES);
         }
         let visible_cube_count = self.gpu_instance_scratch.len() as u32;
         if visible_cube_count > 0 {

@@ -1,10 +1,10 @@
-# PMU (Pick Me Up) — Phase 8 (Part A) Architecture
+# PMU (Pick Me Up) — Phase 8 (Part B) Architecture
 
 ## Module Map
-- `src/main.rs`, `src/app.rs`, `src/input.rs`, `src/camera.rs`: Entry point, window/mouse lifecycle, Q/F/X/V/T/G/E/1/2/3/R/F1–F8 hotkeys, and third-person camera.
+- `src/main.rs`, `src/app.rs`, `src/input.rs`, `src/camera.rs`: Entry point, window/mouse lifecycle, `GameState` pause gate, K/Q/F/X/V/T/G/E/1/2/3/R/F1–F8 hotkeys, and third-person camera.
 - `src/collision.rs`, `src/nav.rs`: 4m spatial collision grid (`CollisionGrid`) and 60x60 A* navigation grid (`NavGrid`, `NavSearchScratch`).
 - `src/combat.rs`, `src/status.rs`: Shared `Faction`/`ActorId`/`CombatantInfo`, `PlayerCombat`, `FloatingNumberPool`, and `StatusEffects` (Burn 4 DPS & Slow 0.5x).
-- `src/skills.rs`, `src/skill_inv.rs`, `src/projectiles.rs`, `src/pickups.rs`: Data-driven `SKILL_TABLE` (9 skills, Tier 1 & Tier 2), mana (100 max, 6/s regen, 1s pause), 4 slots + `T`-key fusion (`FUSION_RECIPES`), sub-stepped `ProjectileManager` (32 projectiles, 32 flashes, meteors, slow zones), and `PickupManager` (16 orbs, 25% drop + guaranteed Wave 1 drop).
+- `src/skills.rs`, `src/skill_inv.rs`, `src/skill_menu.rs`, `src/projectiles.rs`, `src/pickups.rs`, `src/effects.rs`: Data-driven `SKILL_TABLE` (9 skills), `SkillInventory` & `MenuState` (`GameState::Playing`/`Paused`), `ProjectileManager`, `PickupManager` (with orb beacons), and 64-entry priority `EffectsPool` (expanding rings, meteor telegraphs, pickup sparkles, heal particles).
 - `src/ally.rs`: `Ally`, `Rarity` gacha roll (70% Common, 25% Rare, 5% Epic), rarity stats/tints/name pools, `AllyState`, spawn ease-out + flash, and unit tests.
 - `src/squad.rs`: `Squad`, `SquadMode` (`Follow`, `Hold`, `Aggressive`), `AstarBudgetScheduler` (round-robin 3/step), formation slots, sticky attacker-preferring target selection, E-key/wave-start revive, regroup teleport, and unit tests.
 - `src/enemy.rs`, `src/ai.rs`, `src/waves.rs`: `Enemy`, multi-target AI with 3.0s threat memory, and `WaveManager` (`3 + 2*(wave-1) + living_allies`).
@@ -45,15 +45,21 @@
 | `Frost Dash` | 2 (`Ice Shard`+`Wind Dash`) | 25 | 4.0s | 8m dash in 0.2s, leaves 2s Slow zones (r=2.5), i-frames |
 | `Holy Nova` | 2 (`Heal Pulse`+`Shockwave`) | 50 | 8.0s | Heals allies within 8m by 40; damages enemies within 7m by 30 (kb 6) |
 
+## Pause Flow, Ally Skills & Effects Pool
+- **GameState & Pause**: `K` toggles `MenuState` and `GameState::Paused`. While paused, `World::step_if_unpaused`, animations, and mouse camera look are frozen while rendering, HUD, and menu navigation continue. `Escape` closes the menu first before unlocking the cursor or exiting.
+- **Ally Skill Rules**: In `Engage`/`Attack`, Common allies never cast; Rare allies cast `Fireball` (L1, 6.0s CD, 4–14m range + LOS); Epic allies prioritize `Heal Pulse` (20 HP, 10.0s CD, when any living squad member is `<50%` HP) and cast `Fireball` (5.0s CD, 4–14m + LOS), pausing `0.3s` in `Recover`.
+- **Effects Pool (`src/effects.rs`)**: 64-entry pool with priority eviction (`PickupSparkle`/`HealParticles` = 1, `ExpandingRing` = 2, `MeteorTelegraph` = 3) rendered via `TOTAL_CUBE_INSTANCES = 1024` guarded cube buffer.
+
 ## Controls Table
 | Input | Action |
 | :--- | :--- |
 | `Left Click` / `C` / `Space` / `Shift` | Melee Attack / Dodge Roll / Jump / Sprint |
 | `Q` / `F` / `X` / `V` | Cast Skill Slots 1–4 (requires mana, cooldown ready, mouse captured) |
-| `T` | Fuse first available Tier 1 pair (`count >= 2` each) into Tier 2 skill |
-| `G` / `E` (hold) | Summon Ally (`30` score, gacha roll) / Revive Down Ally (`2.0s` within `2.5m`) |
-| `1` / `2` / `3` | Squad Command: `1 = Follow`, `2 = Hold`, `3 = Aggressive` |
-| `R` / `F1`..`F8` / `Escape` | Reset Game / Benchmark & Debug Overlays (`F8` includes Ally AI) / Unlock or Quit |
+| `K` / `T` | Open/Close Skill & Fusion Menu (pauses game) / Quick-Fuse first recipe |
+| `Up`/`Down`, `Tab`/`Left`/`Right` (in Menu) | Select skill/slot/recipe / Switch menu section (`Skills`, `Slots`, `Recipes`) |
+| `1`..`4` / `Backspace` / `Enter` (in Menu) | Assign/swap selected skill to slot 1–4 / Clear slot / Fuse selected recipe |
+| `G` / `E` (hold) / `1`..`3` (in Game) | Summon Ally (`30` score) / Revive Down Ally / Squad Mode (`Follow`/`Hold`/`Aggressive`) |
+| `R` / `F1`..`F8` / `Escape` | Reset Game / Benchmark & Debug Overlays / Close Menu, Unlock, or Quit |
 
 ## Planned Next Phases
 1. **Skills and Abilities**: Mana resource, projectile fireball casting, and skill combining.

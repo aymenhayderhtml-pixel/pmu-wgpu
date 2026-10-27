@@ -2,8 +2,10 @@ use crate::ally::Ally;
 use crate::combat::FloatingNumber;
 use crate::enemy::Enemy;
 use crate::player_anim::AnimMode;
+use crate::pickups::SkillOrb;
 use crate::shadow::ShadowQuality;
-use crate::skill_inv::SkillHudInfo;
+use crate::skill_inv::{SkillHudInfo, SkillInventory};
+use crate::skill_menu::{GameState, MenuState};
 use crate::squad::SquadMode;
 use glam::{Mat4, Vec3};
 use std::fmt::Write;
@@ -74,7 +76,10 @@ pub struct HudTelemetry<'a> {
     pub enemy_state_counts: [u32; 5],
     pub ally_state_counts: [u32; 6],
     pub squad_mode: SquadMode,
+    pub game_state: GameState,
+    pub ally_casts: u32,
     pub status_message: &'a str,
+    pub status_color: [f32; 3],
     pub status_timer: f32,
     pub astar_per_sec: u32,
     pub astar_avg_us: f64,
@@ -97,6 +102,9 @@ pub struct HudTelemetry<'a> {
     pub camera_pos: Vec3,
     pub camera_yaw: f32,
     pub skills: SkillHudInfo,
+    pub skill_inv: &'a SkillInventory,
+    pub menu: &'a MenuState,
+    pub orbs: &'a [SkillOrb],
     pub allies: &'a [Ally],
     pub enemies: &'a [Enemy],
     pub floating_numbers: &'a [FloatingNumber],
@@ -186,7 +194,10 @@ impl StatsTracker {
         enemy_state_counts: [u32; 5],
         ally_state_counts: [u32; 6],
         squad_mode: SquadMode,
+        game_state: GameState,
+        ally_casts: u32,
         status_message: &'a str,
+        status_color: [f32; 3],
         status_timer: f32,
         mouse_captured: bool,
         anim_mode: AnimMode,
@@ -196,6 +207,9 @@ impl StatsTracker {
         joint_count: u32,
         camera_yaw: f32,
         skills: SkillHudInfo,
+        skill_inv: &'a SkillInventory,
+        menu: &'a MenuState,
+        orbs: &'a [SkillOrb],
         allies: &'a [Ally],
         enemies: &'a [Enemy],
         floating_numbers: &'a [FloatingNumber],
@@ -219,7 +233,10 @@ impl StatsTracker {
             enemy_state_counts,
             ally_state_counts,
             squad_mode,
+            game_state,
+            ally_casts,
             status_message,
+            status_color,
             status_timer,
             astar_per_sec: self.last_astar_per_sec,
             astar_avg_us: self.last_astar_avg_us,
@@ -242,6 +259,9 @@ impl StatsTracker {
             camera_pos: Vec3::ZERO,
             camera_yaw,
             skills,
+            skill_inv,
+            menu,
+            orbs,
             allies,
             enemies,
             floating_numbers,

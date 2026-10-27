@@ -3,6 +3,7 @@ use crate::combat::PLAYER_MAX_HEALTH;
 use crate::input::Input;
 use crate::model::{load_scene_models, CpuModel};
 use crate::renderer::{RenderOutcome, Renderer};
+use crate::skill_menu::EscapeOutcome;
 use crate::squad::SquadMode;
 use crate::stats::StatsTracker;
 use crate::world::World;
@@ -128,27 +129,60 @@ impl App {
         if self.input.take_just_pressed(KeyCode::F7) { self.world.toggle_debug_draw(); }
         if self.input.take_just_pressed(KeyCode::F8) { self.world.toggle_ai_debug(); }
         if self.input.take_just_pressed(KeyCode::KeyR) { self.world.reset(); }
-        if self.input.take_just_pressed(KeyCode::KeyG) && !self.world.combat.is_dead() {
-            self.world.summon_ally();
+        if self.input.take_just_pressed(KeyCode::KeyK) {
+            self.world.menu.toggle(&mut self.world.game_state);
         }
-        if self.input.take_just_pressed(KeyCode::Digit1) { self.world.set_squad_mode(SquadMode::Follow); }
-        if self.input.take_just_pressed(KeyCode::Digit2) { self.world.set_squad_mode(SquadMode::Hold); }
-        if self.input.take_just_pressed(KeyCode::Digit3) { self.world.set_squad_mode(SquadMode::Aggressive); }
         if self.input.take_just_pressed(KeyCode::KeyT) && !self.world.combat.is_dead() {
             self.world.try_fuse_skills();
         }
-        let cam_fwd = self.camera.forward_xz();
-        if self.input.take_just_pressed(KeyCode::KeyQ) {
-            self.world.cast_skill_slot(0, cam_fwd, self.mouse_captured);
-        }
-        if self.input.take_just_pressed(KeyCode::KeyF) {
-            self.world.cast_skill_slot(1, cam_fwd, self.mouse_captured);
-        }
-        if self.input.take_just_pressed(KeyCode::KeyX) {
-            self.world.cast_skill_slot(2, cam_fwd, self.mouse_captured);
-        }
-        if self.input.take_just_pressed(KeyCode::KeyV) {
-            self.world.cast_skill_slot(3, cam_fwd, self.mouse_captured);
+
+        if self.world.menu.open {
+            if self.input.take_just_pressed(KeyCode::ArrowUp) { self.world.menu.move_up(); }
+            if self.input.take_just_pressed(KeyCode::ArrowDown) { self.world.menu.move_down(); }
+            if self.input.take_just_pressed(KeyCode::ArrowRight) || self.input.take_just_pressed(KeyCode::Tab) {
+                self.world.menu.next_section();
+            }
+            if self.input.take_just_pressed(KeyCode::ArrowLeft) { self.world.menu.prev_section(); }
+            if self.input.take_just_pressed(KeyCode::Digit1) {
+                self.world.menu.assign_selected_to_slot(&mut self.world.skill_inv, 0);
+            }
+            if self.input.take_just_pressed(KeyCode::Digit2) {
+                self.world.menu.assign_selected_to_slot(&mut self.world.skill_inv, 1);
+            }
+            if self.input.take_just_pressed(KeyCode::Digit3) {
+                self.world.menu.assign_selected_to_slot(&mut self.world.skill_inv, 2);
+            }
+            if self.input.take_just_pressed(KeyCode::Digit4) {
+                self.world.menu.assign_selected_to_slot(&mut self.world.skill_inv, 3);
+            }
+            if self.input.take_just_pressed(KeyCode::Backspace) {
+                self.world.menu.clear_slot(&mut self.world.skill_inv);
+            }
+            if self.input.take_just_pressed(KeyCode::Enter) {
+                self.world.try_fuse_selected_menu_recipe();
+            }
+            let _ = self.input.take_mouse_delta();
+            let _ = self.input.take_attack_requested();
+        } else {
+            if self.input.take_just_pressed(KeyCode::KeyG) && !self.world.combat.is_dead() {
+                self.world.summon_ally();
+            }
+            if self.input.take_just_pressed(KeyCode::Digit1) { self.world.set_squad_mode(SquadMode::Follow); }
+            if self.input.take_just_pressed(KeyCode::Digit2) { self.world.set_squad_mode(SquadMode::Hold); }
+            if self.input.take_just_pressed(KeyCode::Digit3) { self.world.set_squad_mode(SquadMode::Aggressive); }
+            let cam_fwd = self.camera.forward_xz();
+            if self.input.take_just_pressed(KeyCode::KeyQ) {
+                self.world.cast_skill_slot(0, cam_fwd, self.mouse_captured);
+            }
+            if self.input.take_just_pressed(KeyCode::KeyF) {
+                self.world.cast_skill_slot(1, cam_fwd, self.mouse_captured);
+            }
+            if self.input.take_just_pressed(KeyCode::KeyX) {
+                self.world.cast_skill_slot(2, cam_fwd, self.mouse_captured);
+            }
+            if self.input.take_just_pressed(KeyCode::KeyV) {
+                self.world.cast_skill_slot(3, cam_fwd, self.mouse_captured);
+            }
         }
 
         let now = Instant::now();
@@ -158,39 +192,42 @@ impl App {
         };
         self.last_frame_instant = Some(now);
 
-        let frame_dt = raw_dt.min(MAX_FRAME_DELTA);
-        self.accumulator += frame_dt;
-
         let cpu_work_start = Instant::now();
 
-        let mut steps = 0;
-        while self.accumulator >= FIXED_DT {
-            if steps >= MAX_CATCHUP_STEPS {
-                self.accumulator = 0.0;
-                break;
+        if !self.world.game_state.is_paused() {
+            let frame_dt = raw_dt.min(MAX_FRAME_DELTA);
+            self.accumulator += frame_dt;
+
+            let mut steps = 0;
+            while self.accumulator >= FIXED_DT {
+                if steps >= MAX_CATCHUP_STEPS {
+                    self.accumulator = 0.0;
+                    break;
+                }
+                let mouse_delta = if self.mouse_captured {
+                    self.input.take_mouse_delta()
+                } else {
+                    let _ = self.input.take_mouse_delta();
+                    (0.0, 0.0)
+                };
+
+                if let Some(ai_stats) = self.world.step_if_unpaused(&mut self.input, &self.camera, FIXED_DT) {
+                    self.stats.record_astar(ai_stats.astar_calls, ai_stats.astar_micros);
+                }
+
+                self.camera.update(
+                    &self.input,
+                    mouse_delta,
+                    self.world.player.pos,
+                    &self.world.collision,
+                    FIXED_DT,
+                );
+                self.accumulator -= FIXED_DT;
+                steps += 1;
             }
-            let mouse_delta = if self.mouse_captured {
-                self.input.take_mouse_delta()
-            } else {
-                let _ = self.input.take_mouse_delta();
-                (0.0, 0.0)
-            };
 
-            let ai_stats = self.world.update(&mut self.input, &self.camera, FIXED_DT);
-            self.stats.record_astar(ai_stats.astar_calls, ai_stats.astar_micros);
-
-            self.camera.update(
-                &self.input,
-                mouse_delta,
-                self.world.player.pos,
-                &self.world.collision,
-                FIXED_DT,
-            );
-            self.accumulator -= FIXED_DT;
-            steps += 1;
+            self.world.update_animation(raw_dt.min(0.10));
         }
-
-        self.world.update_animation(raw_dt.min(0.10));
 
         let alpha = (self.accumulator / FIXED_DT).clamp(0.0, 1.0);
         let outcome = {
@@ -208,7 +245,10 @@ impl App {
                 self.world.enemy_state_counts(),
                 self.world.squad.state_counts(),
                 self.world.squad.mode,
+                self.world.game_state,
+                self.world.squad.total_ally_casts,
                 &self.world.squad.status_message,
+                self.world.squad.status_color,
                 self.world.squad.status_timer,
                 self.mouse_captured,
                 self.world.animator.mode(),
@@ -219,9 +259,12 @@ impl App {
                 self.camera.yaw,
                 self.world.skill_inv.hud_snapshot(
                     self.world.projectiles.active_projectile_count(),
-                    self.world.projectiles.active_effect_count(),
+                    self.world.projectiles.active_effect_count() + self.world.effects.active_count(),
                     self.world.pickups.active_orb_count(),
                 ),
+                &self.world.skill_inv,
+                &self.world.menu,
+                &self.world.pickups.orbs,
                 &self.world.squad.allies,
                 &self.world.enemies,
                 self.world.floating_numbers.entries(),
@@ -277,7 +320,7 @@ impl ApplicationHandler for App {
             WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
                 if !self.mouse_captured {
                     self.set_mouse_capture(true);
-                } else {
+                } else if !self.world.game_state.is_paused() {
                     self.input.request_attack();
                 }
             }
@@ -286,10 +329,10 @@ impl ApplicationHandler for App {
                     && !event.repeat
                     && event.physical_key == PhysicalKey::Code(KeyCode::Escape)
                 {
-                    if self.mouse_captured {
-                        self.set_mouse_capture(false);
-                    } else {
-                        event_loop.exit();
+                    match self.world.menu.handle_escape(&mut self.world.game_state, self.mouse_captured) {
+                        EscapeOutcome::ClosedMenu => {}
+                        EscapeOutcome::ReleaseMouse => self.set_mouse_capture(false),
+                        EscapeOutcome::ExitApp => event_loop.exit(),
                     }
                     return;
                 }
@@ -308,7 +351,7 @@ impl ApplicationHandler for App {
 
     fn device_event(&mut self, _event_loop: &ActiveEventLoop, _device_id: DeviceId, event: DeviceEvent) {
         if let DeviceEvent::MouseMotion { delta: (dx, dy) } = event {
-            if self.mouse_captured {
+            if self.mouse_captured && !self.world.game_state.is_paused() {
                 self.input.accumulate_mouse_delta(dx as f32, dy as f32);
             }
         }
