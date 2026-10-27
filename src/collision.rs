@@ -132,7 +132,7 @@ impl CollisionGrid {
         let player_min_y = pos.y + step_margin;
         let player_max_y = pos.y + height - 0.02;
 
-        for _ in 0..2 {
+        for _ in 0..4 {
             let query_r = radius + 0.25;
             self.query_region(
                 pos.x - query_r,

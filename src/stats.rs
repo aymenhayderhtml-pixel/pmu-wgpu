@@ -4,6 +4,7 @@ use crate::enemy::Enemy;
 use crate::player_anim::AnimMode;
 use crate::game_flow::GameFlow;
 use crate::menu::MenuSystem;
+use crate::offline::OfflineReport;
 use crate::pickups::SkillOrb;
 use crate::shadow::ShadowQuality;
 use crate::skill_inv::{SkillHudInfo, SkillInventory};
@@ -83,6 +84,13 @@ pub struct HudTelemetry<'a> {
     pub fade_alpha: f32,
     pub total_kills: u32,
     pub ally_casts: u32,
+    pub in_camp_phase: bool,
+    pub camp_timer: f32,
+    pub food_stock: u32,
+    pub camp_activity_counts: [u32; 6],
+    pub fairy_state: &'static str,
+    pub selected_ally_idx: usize,
+    pub login_report: Option<&'a OfflineReport>,
     pub status_message: &'a str,
     pub status_color: [f32; 3],
     pub status_timer: f32,

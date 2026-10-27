@@ -4,6 +4,7 @@ use crate::font::{
     build_font_atlas_rgba8, glyph_uv, solid_white_uv, ATLAS_HEIGHT, ATLAS_WIDTH, GLYPH_SIZE,
 };
 use crate::game_flow::GameFlow;
+use crate::hud_life::draw_camp_banner_and_ally_icons;
 use crate::hud_menu::draw_active_menu_and_fade;
 use crate::hud_squad::draw_squad_hud_elements;
 use crate::stats::HudTelemetry;
@@ -259,8 +260,9 @@ impl HudRenderer {
             }
         }
 
-        // 2. Squad HUD elements (left squad panel, ally world bars/names/revive, radar, status msg)
+        // 2. Squad HUD elements + Camp banner & world-space ally activity icons
         draw_squad_hud_elements(&mut self.vertex_scratch, &mut self.text_scratch, sw, sh, telemetry);
+        draw_camp_banner_and_ally_icons(&mut self.vertex_scratch, &mut self.text_scratch, sw, sh, telemetry);
 
         // 3. Floating damage and healing numbers
         for num in telemetry.floating_numbers {
@@ -394,8 +396,8 @@ impl HudRenderer {
         // 6. F3 Top-left debug panel
         if telemetry.show_panel {
             let (panel_x, panel_y) = (10.0, 10.0);
-            let panel_w = 580.0 * (HUD_SCALE * 0.5);
-            let panel_h = line_step * 11.0 + 12.0;
+            let panel_w = 600.0 * (HUD_SCALE * 0.5);
+            let panel_h = line_step * 12.0 + 12.0;
             push_solid_quad(&mut self.vertex_scratch, panel_x, panel_y, panel_w, panel_h, [0.02, 0.03, 0.05, 0.72]);
 
             let text_x = panel_x + 8.0;
@@ -490,6 +492,20 @@ impl HudRenderer {
                 c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7], c[8]
             );
             push_text_line(&mut self.vertex_scratch, &self.text_scratch, text_x, text_y, glyph_px, [0.65, 0.85, 1.0, 1.0]);
+            text_y += line_step;
+
+            let ca = telemetry.camp_activity_counts;
+            self.text_scratch.clear();
+            let _ = write!(
+                &mut self.text_scratch,
+                "Camp:{}({:.0}s) Food:{} Act[E:{} R:{} T:{} S:{} Q:{} Z:{}] Fairy:{}",
+                if telemetry.in_camp_phase { "ON" } else { "OFF" },
+                telemetry.camp_timer,
+                telemetry.food_stock,
+                ca[0], ca[1], ca[2], ca[3], ca[4], ca[5],
+                telemetry.fairy_state
+            );
+            push_text_line(&mut self.vertex_scratch, &self.text_scratch, text_x, text_y, glyph_px, [0.95, 0.85, 1.0, 1.0]);
         }
 
         // 7. Bottom-left controls hint line

@@ -8,12 +8,28 @@ use crate::ally::{
     STUCK_TIME_THRESHOLD, SUMMON_COST, SUMMON_SPAWN_OFFSET, TARGET_STICKY_TIME,
 };
 use crate::camera::lerp_angle;
+use crate::camp::{
+    camp_idle_wander_point, choose_camp_activity, ActivityContext, CampActivity, CampObjectKind,
+    CampZone, ACTIVITY_DECIDE_INTERVAL, REST_HEAL_FRACTION_PER_SEC,
+};
 use crate::collision::CollisionGrid;
 use crate::combat::{compute_separation_force, is_in_attack_arc, ActorId, CombatantInfo};
 use crate::enemy::{
     Enemy, EnemyState, REPATH_INTERVAL, REPATH_TARGET_DRIFT, SEPARATION_RADIUS, SEPARATION_WEIGHT,
 };
+use crate::fairy::{
+    compute_post_quarrel_health, Fairy, FairyTask, FAIRY_STARVING_TRIGGER_SECS,
+};
+use crate::life::{
+    FearReaction, FATIGUE_FROM_TRAIN_OR_SPAR, FATIGUE_REST_DECAY_PER_SEC, SCOLDED_DURATION,
+    START_FOOD_STOCK,
+};
 use crate::nav::{NavGrid, NavSearchScratch};
+use crate::training::{
+    apply_non_lethal_spar_hit, resolve_training_session, should_escalate_spar_to_quarrel,
+    SkillGainEvent, TrainRollKind, ALLY_TRAINING_DEATH_CHANCE, QUARREL_DAMAGE_MULT,
+    QUARREL_MAX_DURATION, SPAR_XP_GAIN,
+};
 use crate::world::GROUND_SIZE;
 use glam::{Vec2, Vec3};
 use std::fmt::Write;
@@ -39,7 +55,6 @@ impl SquadMode {
     }
 }
 
-/// Round-robin A* pathfinding budget scheduler shared fairly between all allies and enemies.
 pub struct AstarBudgetScheduler {
     pub remaining_this_step: usize,
     next_cursor: usize,
@@ -57,7 +72,6 @@ impl AstarBudgetScheduler {
         self.remaining_this_step = MAX_SHARED_ASTAR_BUDGET;
     }
 
-    /// Selects up to `MAX_SHARED_ASTAR_BUDGET` request indices in round-robin order across `requests`.
     pub fn grant_round_robin(&mut self, requests: &[bool], out_granted: &mut [bool]) {
         let n = requests.len().min(out_granted.len());
         for flag in &mut out_granted[..n] {
@@ -113,12 +127,11 @@ pub struct SquadUpdateOutput {
     pub skill_casts: [Option<AllySkillCast>; MAX_ALLIES],
     pub skill_cast_count: usize,
     pub revived_ally_pos_and_heal: Option<(Vec3, u32)>,
+    pub fairy_flash_pos: Option<Vec3>,
     pub astar_calls: u32,
     pub astar_micros: u64,
 }
 
-/// Computes the world-space formation slot for `slot_index` (`0..4`) on a circle of radius
-/// `FOLLOW_DISTANCE` (3.0m) behind and beside the player relative to `player_yaw`.
 pub fn compute_formation_slot(player_pos: Vec3, player_yaw: f32, slot_index: usize) -> Vec3 {
     let local_angles_deg: [f32; 4] = [135.0, -135.0, 90.0, -90.0];
     let offset_rad = local_angles_deg[slot_index % 4].to_radians();
@@ -127,8 +140,6 @@ pub fn compute_formation_slot(player_pos: Vec3, player_yaw: f32, slot_index: usi
     player_pos + dir * FOLLOW_DISTANCE
 }
 
-/// Selects the best visible enemy target for an ally, preferring enemies attacking the player
-/// or an ally and respecting the 1.5s target stickiness window.
 pub fn select_ally_target(
     ally_pos: Vec3,
     anchor_pos: Vec3,
@@ -188,6 +199,11 @@ pub fn select_ally_target(
 pub struct Squad {
     pub allies: Vec<Ally>,
     pub mode: SquadMode,
+    pub food_stock: u32,
+    pub camp: CampZone,
+    pub fairy: Fairy,
+    pub selected_ally_idx: usize,
+    pub training_sessions_completed: u32,
     pub rng_state: u64,
     next_ally_id: u32,
     name_cursors: [usize; 3],
@@ -202,6 +218,11 @@ impl Squad {
         Self {
             allies: Vec::with_capacity(MAX_ALLIES),
             mode: SquadMode::Follow,
+            food_stock: START_FOOD_STOCK,
+            camp: CampZone::new(),
+            fairy: Fairy::new(),
+            selected_ally_idx: 0,
+            training_sessions_completed: 0,
             rng_state: seed ^ 0x55AA_AA55_1234_5678,
             next_ally_id: 1,
             name_cursors: [0; 3],
@@ -215,6 +236,11 @@ impl Squad {
     pub fn reset(&mut self, seed: u64) {
         self.allies.clear();
         self.mode = SquadMode::Follow;
+        self.food_stock = START_FOOD_STOCK;
+        self.camp = CampZone::new();
+        self.fairy.clear();
+        self.selected_ally_idx = 0;
+        self.training_sessions_completed = 0;
         self.rng_state = seed ^ 0x55AA_AA55_1234_5678;
         self.next_ally_id = 1;
         self.name_cursors = [0; 3];
@@ -236,8 +262,27 @@ impl Squad {
                 AllyState::Engage => counts[1] += 1,
                 AllyState::Attack => counts[2] += 1,
                 AllyState::Recover => counts[3] += 1,
-                AllyState::Regroup => counts[4] += 1,
+                AllyState::Regroup | AllyState::Flee | AllyState::Freeze => counts[4] += 1,
                 AllyState::Down => counts[5] += 1,
+            }
+        }
+        counts
+    }
+
+    /// Returns `[Eat, Rest, Train, Spar, Quarrel, Idle]` counts during the camp phase.
+    pub fn camp_activity_counts(&self) -> [u32; 6] {
+        let mut counts = [0u32; 6];
+        for a in &self.allies {
+            if a.is_down() {
+                continue;
+            }
+            match a.camp_activity {
+                CampActivity::Eat => counts[0] += 1,
+                CampActivity::Rest => counts[1] += 1,
+                CampActivity::Train => counts[2] += 1,
+                CampActivity::Spar => counts[3] += 1,
+                CampActivity::Quarrel => counts[4] += 1,
+                CampActivity::Idle => counts[5] += 1,
             }
         }
         counts
@@ -301,7 +346,7 @@ impl Squad {
 
         let id = self.next_ally_id;
         self.next_ally_id = self.next_ally_id.wrapping_add(1);
-        let ally = Ally::new(
+        let ally = Ally::new_with_seed(
             id,
             name,
             rarity,
@@ -309,6 +354,7 @@ impl Squad {
             player_yaw,
             skeleton_node_count,
             initial_clip,
+            &mut self.rng_state,
         );
         self.allies.push(ally);
 
@@ -342,7 +388,7 @@ impl Squad {
         pool[0]
     }
 
-    /// Revives all `Down` allies with 50% health at the start of a new wave.
+    /// Revives all `Down` allies with 50% health and prepares for camp or wave.
     pub fn revive_all_down_for_new_wave(&mut self) -> Vec<(Vec3, u32)> {
         let mut revived = Vec::new();
         for ally in &mut self.allies {
@@ -354,9 +400,42 @@ impl Squad {
         revived
     }
 
-    /// Checks which allies need an A* path calculation this step.
+    pub fn enter_camp_phase(&mut self) -> Vec<(Vec3, u32)> {
+        let revived = self.revive_all_down_for_new_wave();
+        self.camp.reset_users();
+        self.fairy.clear();
+        for ally in &mut self.allies {
+            ally.state = AllyState::Follow;
+            ally.target_enemy_id = None;
+            ally.camp_activity = CampActivity::Idle;
+            ally.activity_timer = 0.0;
+            ally.decide_timer = 0.0;
+            ally.spar_partner_id = None;
+            ally.only_quarrel_damage = true;
+            ally.pre_quarrel_hp = ally.health;
+            ally.path.clear();
+        }
+        revived
+    }
+
+    pub fn exit_camp_phase(&mut self) {
+        self.camp.reset_users();
+        self.fairy.clear();
+        for ally in &mut self.allies {
+            if ally.is_living() {
+                ally.state = AllyState::Follow;
+            }
+            ally.camp_activity = CampActivity::Idle;
+            ally.activity_timer = 0.0;
+            ally.decide_timer = 0.0;
+            ally.spar_partner_id = None;
+            ally.path.clear();
+        }
+    }
+
     pub fn collect_astar_requests(
         &self,
+        in_camp_phase: bool,
         player_pos: Vec3,
         enemies: &[Enemy],
         collision: &CollisionGrid,
@@ -368,21 +447,25 @@ impl Squad {
             if ally.is_down() || ally.repath_timer > 0.0 {
                 continue;
             }
-            let goal_pos = match ally.state {
-                AllyState::Engage => enemies
-                    .iter()
-                    .find(|e| Some(e.id) == ally.target_enemy_id && e.is_alive())
-                    .map(|e| e.pos)
-                    .unwrap_or(ally.slot_pos),
-                AllyState::Follow => {
-                    if self.mode == SquadMode::Hold {
-                        ally.hold_pos
-                    } else {
-                        ally.slot_pos
+            let goal_pos = if in_camp_phase {
+                ally.activity_target_pos
+            } else {
+                match ally.state {
+                    AllyState::Engage => enemies
+                        .iter()
+                        .find(|e| Some(e.id) == ally.target_enemy_id && e.is_alive())
+                        .map(|e| e.pos)
+                        .unwrap_or(ally.slot_pos),
+                    AllyState::Follow => {
+                        if self.mode == SquadMode::Hold {
+                            ally.hold_pos
+                        } else {
+                            ally.slot_pos
+                        }
                     }
+                    AllyState::Regroup | AllyState::Flee => player_pos,
+                    _ => continue,
                 }
-                AllyState::Regroup => player_pos,
-                _ => continue,
             };
 
             let ally_xz = Vec2::new(ally.pos.x, ally.pos.z);
@@ -398,21 +481,20 @@ impl Squad {
 
             if !los {
                 let drifted = ally.path_goal.distance(goal_xz) > REPATH_TARGET_DRIFT;
-                if ally.path.is_empty() || ally.path_index >= ally.path.len() || drifted {
+                if ally.path.is_empty() || ally.path_index >= enemy_or_path_len(&ally.path) || drifted
+                {
                     out_requests[i] = true;
                 }
             }
         }
     }
 
-    pub fn update(
+    /// Updates autonomous ally camp decisions, activities, training, sparring, quarrels, and the Fairy.
+    pub fn update_camp_phase(
         &mut self,
         dt: f32,
         player_pos: Vec3,
-        player_yaw: f32,
-        player_hp_ratio: f32,
         holding_revive_key: bool,
-        enemies: &[Enemy],
         actors: &[CombatantInfo],
         astar_granted: &[bool; MAX_ALLIES],
         collision: &CollisionGrid,
@@ -425,28 +507,436 @@ impl Squad {
             skill_casts: [None; MAX_ALLIES],
             skill_cast_count: 0,
             revived_ally_pos_and_heal: None,
+            fairy_flash_pos: None,
             astar_calls: 0,
             astar_micros: 0,
         };
-
-        let any_squad_member_below_half = player_hp_ratio < ALLY_HEAL_THRESHOLD_RATIO
-            || self
-                .allies
-                .iter()
-                .any(|a| a.is_living() && (a.health / a.max_health.max(1.0)) < ALLY_HEAL_THRESHOLD_RATIO);
 
         if self.status_timer > 0.0 {
             self.status_timer = (self.status_timer - dt).max(0.0);
         }
 
-        // Handle E-key revive on the nearest Down ally within REVIVE_RANGE (2.5m)
+        self.handle_player_revive(dt, player_pos, holding_revive_key, &mut out);
+
+        // Update Fairy flight and check completion
+        let fairy_dest = match self.fairy.active_task {
+            Some(FairyTask::StopQuarrel { ally_a_id, ally_b_id, .. }) => {
+                let pa = self.allies.iter().find(|a| a.id == ally_a_id).map(|a| a.pos);
+                let pb = self.allies.iter().find(|a| a.id == ally_b_id).map(|a| a.pos);
+                match (pa, pb) {
+                    (Some(a), Some(b)) => Some((a + b) * 0.5),
+                    (Some(a), None) => Some(a),
+                    _ => None,
+                }
+            }
+            Some(FairyTask::FeedStarving { ally_id, .. }) => {
+                self.allies.iter().find(|a| a.id == ally_id).map(|a| a.pos)
+            }
+            None => None,
+        };
+
+        if let Some(done_task) = self.fairy.update(dt, fairy_dest) {
+            match done_task {
+                FairyTask::StopQuarrel { ally_a_id, ally_b_id, target_pos } => {
+                    out.fairy_flash_pos = Some(target_pos);
+                    let mut name_a = "Ally";
+                    let mut name_b = "Ally";
+                    for ally in &mut self.allies {
+                        if ally.id == ally_a_id || ally.id == ally_b_id {
+                            if ally.id == ally_a_id {
+                                name_a = ally.name;
+                            } else {
+                                name_b = ally.name;
+                            }
+                            ally.health = compute_post_quarrel_health(
+                                ally.health,
+                                ally.pre_quarrel_hp,
+                                ally.max_health,
+                                ally.only_quarrel_damage,
+                            );
+                            ally.needs.fear = 0.0;
+                            ally.needs.scolded_timer = SCOLDED_DURATION;
+                            ally.camp_activity = CampActivity::Idle;
+                            ally.activity_timer = SCOLDED_DURATION;
+                            ally.spar_partner_id = None;
+                            ally.hit_flash_timer = 0.25;
+                        }
+                    }
+                    let mut msg = String::with_capacity(64);
+                    let _ = write!(&mut msg, "The fairy stopped the fight between {} and {}", name_a, name_b);
+                    self.set_status_message_colored(&msg, [1.0, 0.70, 0.92]);
+                }
+                FairyTask::FeedStarving { ally_id, target_pos } => {
+                    out.fairy_flash_pos = Some(target_pos);
+                    if let Some(ally) = self.allies.iter_mut().find(|a| a.id == ally_id) {
+                        ally.needs.eat_meal();
+                        ally.hit_flash_timer = 0.25;
+                        let name = ally.name;
+                        let mut msg = String::with_capacity(48);
+                        let _ = write!(&mut msg, "The fairy fed {}", name);
+                        self.set_status_message_colored(&msg, [1.0, 0.70, 0.92]);
+                    }
+                }
+            }
+        }
+
+        // Count current object reservations
+        self.camp.reset_users();
+        for ally in &self.allies {
+            if ally.is_living() && ally.activity_timer > 0.0 {
+                let kind = ally.camp_activity.object_kind(ally.profile.class);
+                let _ = self.camp.try_reserve(kind);
+            }
+        }
+
+        let mut pending_toast: Option<(String, [f32; 3])> = None;
+        let mut died_in_training_id: Option<(u32, &'static str)> = None;
+        let mut new_quarrel_pair: Option<(u32, u32)> = None;
+
+        for idx in 0..self.allies.len() {
+            if self.allies[idx].is_down() {
+                continue;
+            }
+
+            let hp_ratio = self.allies[idx].health / self.allies[idx].max_health.max(1.0);
+            let prof = self.allies[idx].profile;
+            let _ = self.allies[idx]
+                .needs
+                .update(dt, false, hp_ratio, 0, false, &prof);
+
+            // Check if fairy needs to feed a starving ally (hunger == 100 for 10s with food > 0)
+            if !self.fairy.is_active()
+                && self.food_stock > 0
+                && self.allies[idx].needs.starving_at_100_timer >= FAIRY_STARVING_TRIGGER_SECS
+            {
+                self.allies[idx].needs.starving_at_100_timer = 0.0;
+                self.fairy
+                    .start_feed_intervention(self.allies[idx].id, self.allies[idx].pos);
+            }
+
+            self.allies[idx].prev_pos = self.allies[idx].pos;
+            self.allies[idx].prev_yaw = self.allies[idx].yaw;
+            self.allies[idx].hit_flash_timer = (self.allies[idx].hit_flash_timer - dt).max(0.0);
+            self.allies[idx].spawn_fx_timer = (self.allies[idx].spawn_fx_timer - dt).max(0.0);
+            self.allies[idx].repath_timer = (self.allies[idx].repath_timer - dt).max(0.0);
+            self.allies[idx].decide_timer = (self.allies[idx].decide_timer - dt).max(0.0);
+
+            // Re-decide activity every 2s when Idle or when previous activity finished
+            let should_decide = self.allies[idx].activity_timer <= 0.0
+                || (self.allies[idx].camp_activity == CampActivity::Idle
+                    && self.allies[idx].decide_timer <= 0.0);
+
+            if should_decide && self.allies[idx].camp_activity != CampActivity::Quarrel {
+                self.allies[idx].decide_timer = ACTIVITY_DECIDE_INTERVAL;
+                let my_id = self.allies[idx].id;
+                let partner_avail = self.allies.iter().any(|other| {
+                    other.id != my_id
+                        && other.is_living()
+                        && (other.health / other.max_health.max(1.0)) >= 0.60
+                        && other.needs.hunger <= 80.0
+                        && matches!(other.camp_activity, CampActivity::Idle | CampActivity::Spar)
+                });
+
+                let train_kind = CampActivity::Train.object_kind(self.allies[idx].profile.class);
+                let ctx = ActivityContext {
+                    hp_fraction: hp_ratio,
+                    food_stock: self.food_stock,
+                    pot_free: self.camp.has_free_slot(CampObjectKind::FoodPot),
+                    rest_free: self.camp.has_free_slot(CampObjectKind::RestMat),
+                    train_free: self.camp.has_free_slot(train_kind),
+                    spar_partner_available: partner_avail,
+                };
+
+                let chosen = choose_camp_activity(
+                    &self.allies[idx].profile,
+                    &self.allies[idx].needs,
+                    &ctx,
+                    &mut self.rng_state,
+                );
+
+                let obj_kind = chosen.object_kind(self.allies[idx].profile.class);
+                let target_pt = if chosen == CampActivity::Idle {
+                    camp_idle_wander_point(&mut self.rng_state)
+                } else {
+                    self.camp
+                        .try_reserve(obj_kind)
+                        .unwrap_or_else(|| camp_idle_wander_point(&mut self.rng_state))
+                };
+
+                self.allies[idx].camp_activity = chosen;
+                self.allies[idx].activity_timer = chosen.duration();
+                self.allies[idx].activity_target_pos = target_pt;
+                self.allies[idx].path.clear();
+
+                if chosen == CampActivity::Spar {
+                    let partner_id = self
+                        .allies
+                        .iter()
+                        .find(|o| o.id != my_id && o.is_living() && o.needs.scolded_timer <= 0.0)
+                        .map(|o| o.id);
+                    self.allies[idx].spar_partner_id = partner_id;
+                } else {
+                    self.allies[idx].spar_partner_id = None;
+                }
+            }
+
+            let ally_xz = Vec2::new(self.allies[idx].pos.x, self.allies[idx].pos.z);
+            let target_xz = Vec2::new(
+                self.allies[idx].activity_target_pos.x,
+                self.allies[idx].activity_target_pos.z,
+            );
+            let dist_to_spot = ally_xz.distance(target_xz);
+
+            if dist_to_spot > 1.35 {
+                // Walk to the camp object interaction point
+                let sep = compute_separation_force(
+                    ActorId::Ally(self.allies[idx].id),
+                    ally_xz,
+                    actors,
+                    SEPARATION_RADIUS,
+                );
+                let move_spd = ALLY_WALK_SPEED * self.allies[idx].effective_speed_mult();
+                let steer_pt = Self::steer_toward_point(
+                    &mut self.allies[idx],
+                    target_xz,
+                    astar_granted[idx],
+                    collision,
+                    nav,
+                    nav_scratch,
+                    &mut out,
+                );
+                let seek = (steer_pt - ally_xz).normalize_or_zero();
+                let mut vel = seek * move_spd + sep * SEPARATION_WEIGHT;
+                if vel.length() > move_spd {
+                    vel = vel.normalize() * move_spd;
+                }
+                self.allies[idx].vel.x = vel.x;
+                self.allies[idx].vel.z = vel.y;
+                if vel.length_squared() > 0.04 {
+                    let ty = f32::atan2(-vel.x, -vel.y);
+                    self.allies[idx].yaw =
+                        lerp_angle(self.allies[idx].yaw, ty, (10.0 * dt).min(1.0));
+                }
+            } else {
+                // At the interaction spot: perform the activity!
+                self.allies[idx].vel = Vec3::ZERO;
+                self.allies[idx].activity_timer -= dt;
+
+                match self.allies[idx].camp_activity {
+                    CampActivity::Rest => {
+                        let heal =
+                            self.allies[idx].max_health * REST_HEAL_FRACTION_PER_SEC * dt;
+                        let actual_heal = (self.allies[idx].max_health - self.allies[idx].health)
+                            .clamp(0.0, heal);
+                        self.allies[idx].health += actual_heal;
+                        self.allies[idx].needs.fatigue = (self.allies[idx].needs.fatigue
+                            - FATIGUE_REST_DECAY_PER_SEC * dt)
+                            .max(0.0);
+                        if let Some(new_lvl) = self.allies[idx]
+                            .profile
+                            .passives
+                            .record_rest_healed(actual_heal)
+                        {
+                            self.allies[idx].refresh_stats_from_profile();
+                            let mut s = String::with_capacity(48);
+                            let _ = write!(
+                                &mut s,
+                                "{} learned Pain Tolerance Lv{}",
+                                self.allies[idx].name, new_lvl
+                            );
+                            pending_toast = Some((s, [0.45, 0.95, 1.0]));
+                        }
+                    }
+                    CampActivity::Spar => {
+                        let spar_dps = self.allies[idx].effective_damage() * 0.25;
+                        apply_non_lethal_spar_hit(&mut self.allies[idx].health, spar_dps * dt);
+                        self.allies[idx]
+                            .profile
+                            .passives
+                            .record_damage_taken(spar_dps * dt);
+
+                        // Check quarrel escalation once mid-spar
+                        if (self.allies[idx].activity_timer - 4.0).abs() < dt * 0.6 {
+                            if let Some(pid) = self.allies[idx].spar_partner_id {
+                                if let Some(p_ally) = self.allies.iter().find(|a| a.id == pid) {
+                                    let p_prof = p_ally.profile;
+                                    let p_needs = p_ally.needs;
+                                    if should_escalate_spar_to_quarrel(
+                                        &self.allies[idx].profile,
+                                        &self.allies[idx].needs,
+                                        &p_prof,
+                                        &p_needs,
+                                        &mut self.rng_state,
+                                    ) {
+                                        new_quarrel_pair = Some((self.allies[idx].id, pid));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    CampActivity::Quarrel => {
+                        let q_dps =
+                            self.allies[idx].effective_damage() * QUARREL_DAMAGE_MULT;
+                        self.allies[idx].health =
+                            (self.allies[idx].health - q_dps * dt).max(1.0);
+                    }
+                    _ => {}
+                }
+
+                // Activity finished!
+                if self.allies[idx].activity_timer <= 0.0 {
+                    match self.allies[idx].camp_activity {
+                        CampActivity::Eat => {
+                            if self.food_stock > 0 {
+                                self.food_stock -= 1;
+                                self.allies[idx].needs.eat_meal();
+                            }
+                        }
+                        CampActivity::Train => {
+                            self.training_sessions_completed += 1;
+                            let name = self.allies[idx].name;
+                            let hp_f = self.allies[idx].health
+                                / self.allies[idx].max_health.max(1.0);
+                            let mut prof_copy = self.allies[idx].profile;
+                            let mut needs_copy = self.allies[idx].needs;
+                            let t_out = resolve_training_session(
+                                &mut prof_copy,
+                                &mut needs_copy,
+                                hp_f,
+                                ALLY_TRAINING_DEATH_CHANCE,
+                                &mut self.rng_state,
+                            );
+                            self.allies[idx].profile = prof_copy;
+                            self.allies[idx].needs = needs_copy;
+
+                            if t_out.died {
+                                died_in_training_id = Some((self.allies[idx].id, name));
+                            } else {
+                                self.allies[idx].refresh_stats_from_profile();
+                                if let Some(new_lvl) = t_out.leveled_up_to {
+                                    self.allies[idx].hit_flash_timer = 0.30;
+                                    let mut s = String::with_capacity(48);
+                                    let _ = write!(&mut s, "{} reached level {}", name, new_lvl);
+                                    pending_toast = Some((s, [0.35, 1.0, 0.55]));
+                                } else if t_out.roll == TrainRollKind::NoGain {
+                                    let mut s = String::with_capacity(48);
+                                    let _ = write!(&mut s, "{} trained but learned nothing", name);
+                                    pending_toast = Some((s, [0.75, 0.78, 0.82]));
+                                }
+                                match t_out.skill_event {
+                                    SkillGainEvent::None => {}
+                                    SkillGainEvent::Learned(sk, _) => {
+                                        let mut s = String::with_capacity(56);
+                                        let _ = write!(&mut s, "{} learned {}", name, sk.name());
+                                        pending_toast = Some((s, [0.40, 0.95, 1.0]));
+                                    }
+                                    SkillGainEvent::Improved(sk, lv) => {
+                                        let mut s = String::with_capacity(56);
+                                        let _ = write!(
+                                            &mut s,
+                                            "{} improved {} Lv{}",
+                                            name,
+                                            sk.name(),
+                                            lv
+                                        );
+                                        pending_toast = Some((s, [0.40, 0.95, 1.0]));
+                                    }
+                                    SkillGainEvent::CombinedSwordShield(lv) => {
+                                        let mut s = String::with_capacity(64);
+                                        let _ = write!(
+                                            &mut s,
+                                            "{} combined skills: Basic Sword-Shield Lv {}",
+                                            name, lv
+                                        );
+                                        pending_toast = Some((s, [1.0, 0.88, 0.30]));
+                                    }
+                                }
+                            }
+                        }
+                        CampActivity::Spar => {
+                            let name = self.allies[idx].name;
+                            self.allies[idx].needs.fatigue = (self.allies[idx].needs.fatigue
+                                + FATIGUE_FROM_TRAIN_OR_SPAR)
+                                .min(100.0);
+                            if self.allies[idx].profile.add_xp(SPAR_XP_GAIN) {
+                                self.allies[idx].refresh_stats_from_profile();
+                                self.allies[idx].hit_flash_timer = 0.30;
+                                let mut s = String::with_capacity(48);
+                                let _ = write!(
+                                    &mut s,
+                                    "{} reached level {}",
+                                    name, self.allies[idx].profile.level
+                                );
+                                pending_toast = Some((s, [0.35, 1.0, 0.55]));
+                            }
+                        }
+                        _ => {}
+                    }
+                    self.allies[idx].camp_activity = CampActivity::Idle;
+                    self.allies[idx].activity_timer = 0.0;
+                }
+            }
+
+            self.allies[idx].pos.x += self.allies[idx].vel.x * dt;
+            self.allies[idx].pos.z += self.allies[idx].vel.z * dt;
+            let mut pos_c = self.allies[idx].pos;
+            let mut vel_c = self.allies[idx].vel;
+            collision.resolve_player_xz(
+                &mut pos_c,
+                &mut vel_c,
+                ALLY_RADIUS,
+                ALLY_HEIGHT,
+                GROUND_SIZE * 0.5,
+            );
+            self.allies[idx].pos = pos_c;
+            self.allies[idx].vel = vel_c;
+        }
+
+        if let Some((id_a, id_b)) = new_quarrel_pair {
+            let mut mid = Vec3::ZERO;
+            for ally in &mut self.allies {
+                if ally.id == id_a || ally.id == id_b {
+                    ally.pre_quarrel_hp = ally.health;
+                    ally.only_quarrel_damage = true;
+                    ally.camp_activity = CampActivity::Quarrel;
+                    ally.activity_timer = QUARREL_MAX_DURATION;
+                    mid += ally.pos * 0.5;
+                }
+            }
+            self.fairy.start_quarrel_intervention(id_a, id_b, mid);
+        }
+
+        if let Some((dead_id, dead_name)) = died_in_training_id {
+            self.allies.retain(|a| a.id != dead_id);
+            let mut s = String::with_capacity(48);
+            let _ = write!(&mut s, "{} died while training", dead_name);
+            self.set_status_message_colored(&s, [1.0, 0.22, 0.22]);
+        } else if let Some((msg, col)) = pending_toast {
+            self.set_status_message_colored(&msg, col);
+        }
+
+        out
+    }
+
+    fn handle_player_revive(
+        &mut self,
+        dt: f32,
+        player_pos: Vec3,
+        holding_revive_key: bool,
+        out: &mut SquadUpdateOutput,
+    ) {
         let mut revived_name: Option<&'static str> = None;
         let nearest_down_idx = self
             .allies
             .iter()
             .enumerate()
             .filter(|(_, a)| a.is_down())
-            .map(|(i, a)| (i, Vec2::new(a.pos.x - player_pos.x, a.pos.z - player_pos.z).length()))
+            .map(|(i, a)| {
+                (
+                    i,
+                    Vec2::new(a.pos.x - player_pos.x, a.pos.z - player_pos.z).length(),
+                )
+            })
             .filter(|(_, d)| *d <= REVIVE_RANGE)
             .min_by(|a, b| a.1.total_cmp(&b.1))
             .map(|(i, _)| i);
@@ -470,8 +960,47 @@ impl Squad {
         if let Some(name) = revived_name {
             self.status_message.clear();
             let _ = write!(&mut self.status_message, "{} was revived", name);
+            self.status_color = [0.35, 1.0, 0.55];
             self.status_timer = STATUS_MESSAGE_DURATION;
         }
+    }
+
+    pub fn update(
+        &mut self,
+        dt: f32,
+        player_pos: Vec3,
+        player_yaw: f32,
+        player_hp_ratio: f32,
+        holding_revive_key: bool,
+        enemies: &[Enemy],
+        actors: &[CombatantInfo],
+        astar_granted: &[bool; MAX_ALLIES],
+        collision: &CollisionGrid,
+        nav: &NavGrid,
+        nav_scratch: &mut NavSearchScratch,
+    ) -> SquadUpdateOutput {
+        let mut out = SquadUpdateOutput {
+            hits: [AllyAttackHit::default(); MAX_ALLIES],
+            hit_count: 0,
+            skill_casts: [None; MAX_ALLIES],
+            skill_cast_count: 0,
+            revived_ally_pos_and_heal: None,
+            fairy_flash_pos: None,
+            astar_calls: 0,
+            astar_micros: 0,
+        };
+
+        if self.status_timer > 0.0 {
+            self.status_timer = (self.status_timer - dt).max(0.0);
+        }
+
+        self.handle_player_revive(dt, player_pos, holding_revive_key, &mut out);
+
+        let any_squad_member_below_half = player_hp_ratio < ALLY_HEAL_THRESHOLD_RATIO
+            || self
+                .allies
+                .iter()
+                .any(|a| a.is_living() && (a.health / a.max_health.max(1.0)) < ALLY_HEAL_THRESHOLD_RATIO);
 
         let player_xz = Vec2::new(player_pos.x, player_pos.z);
 
@@ -501,30 +1030,82 @@ impl Squad {
             let ally_xz = Vec2::new(ally.pos.x, ally.pos.z);
             let dist_to_player = ally_xz.distance(player_xz);
 
+            // Count nearby enemies for fear dynamics
+            let mut enemies_within_6m = 0usize;
+            let mut any_within_12m = false;
+            for e in enemies {
+                if !e.is_alive() {
+                    continue;
+                }
+                let d_sq = Vec2::new(e.pos.x - ally.pos.x, e.pos.z - ally.pos.z).length_squared();
+                if d_sq <= 6.0 * 6.0 {
+                    enemies_within_6m += 1;
+                }
+                if d_sq <= 12.0 * 12.0 {
+                    any_within_12m = true;
+                }
+            }
+
+            let hp_ratio = ally.health / ally.max_health.max(1.0);
+            let prof_copy = ally.profile;
+            let fear_react = ally.needs.update(
+                dt,
+                false,
+                hp_ratio,
+                enemies_within_6m,
+                any_within_12m,
+                &prof_copy,
+            );
+
+            match fear_react {
+                FearReaction::FreezeThenFlee if ally.needs.freeze_timer > 0.0 => {
+                    ally.state = AllyState::Freeze;
+                    ally.vel = Vec3::ZERO;
+                    ally.target_enemy_id = None;
+                    continue;
+                }
+                FearReaction::FreezeThenFlee | FearReaction::Flee => {
+                    ally.state = AllyState::Flee;
+                    ally.target_enemy_id = None;
+                }
+                FearReaction::None => {
+                    if matches!(ally.state, AllyState::Flee | AllyState::Freeze) {
+                        ally.state = AllyState::Follow;
+                    }
+                }
+            }
+
+            let refuses_fights = ally.needs.refuses_combat();
             let (aggro_range, anchor_pos) = match self.mode {
                 SquadMode::Follow => (ALLY_AGGRO_RANGE, player_pos),
                 SquadMode::Hold => (HOLD_DEFEND_RANGE, ally.hold_pos),
                 SquadMode::Aggressive => (AGGRESSIVE_AGGRO_RANGE, ally.pos),
             };
 
-            let new_target = select_ally_target(
-                ally.pos,
-                anchor_pos,
-                aggro_range,
-                ally.target_enemy_id,
-                ally.target_lock_timer,
-                enemies,
-                collision,
-            );
-            if new_target != ally.target_enemy_id {
-                ally.target_enemy_id = new_target;
-                ally.target_lock_timer = 0.0;
-                ally.path.clear();
+            if ally.state != AllyState::Flee && !refuses_fights {
+                let new_target = select_ally_target(
+                    ally.pos,
+                    anchor_pos,
+                    aggro_range,
+                    ally.target_enemy_id,
+                    ally.target_lock_timer,
+                    enemies,
+                    collision,
+                );
+                if new_target != ally.target_enemy_id {
+                    ally.target_enemy_id = new_target;
+                    ally.target_lock_timer = 0.0;
+                    ally.path.clear();
+                }
+            } else {
+                ally.target_enemy_id = None;
+                if refuses_fights && ally.state == AllyState::Engage {
+                    ally.state = AllyState::Follow;
+                }
             }
 
-            // Check regroup condition (far from player or stuck > 2s, except in Hold mode)
             if self.mode != SquadMode::Hold
-                && ally.state != AllyState::Regroup
+                && !matches!(ally.state, AllyState::Regroup | AllyState::Flee)
                 && (dist_to_player > REGROUP_DISTANCE || ally.stuck_timer >= STUCK_TIME_THRESHOLD)
             {
                 ally.state = AllyState::Regroup;
@@ -539,16 +1120,14 @@ impl Squad {
                 actors,
                 SEPARATION_RADIUS,
             );
-            let spd_mult = ally.rarity.speed_mult();
+            let spd_mult = ally.effective_speed_mult();
             let mut desired_vel_xz = Vec2::ZERO;
             let mut trying_to_move = false;
 
-            // Rare and Epic ally skill casting in Engage and Attack states
             if (ally.state == AllyState::Engage || ally.state == AllyState::Attack)
                 && ally.rarity != Rarity::Common
             {
                 let mut casted = false;
-                // Epic Heal Pulse takes priority when any living squad member is below 50% HP
                 if ally.rarity == Rarity::Epic && ally.heal_cd <= 0.0 && any_squad_member_below_half
                 {
                     ally.heal_cd = EPIC_HEAL_COOLDOWN;
@@ -603,6 +1182,24 @@ impl Squad {
             }
 
             match ally.state {
+                AllyState::Flee => {
+                    trying_to_move = true;
+                    let flee_spd = ALLY_RUN_SPEED * spd_mult;
+                    let steer_pt = Self::steer_toward_point(
+                        ally,
+                        Vec2::new(ally.slot_pos.x, ally.slot_pos.z),
+                        astar_granted[idx],
+                        collision,
+                        nav,
+                        nav_scratch,
+                        &mut out,
+                    );
+                    let seek = (steer_pt - ally_xz).normalize_or_zero();
+                    desired_vel_xz = seek * flee_spd + sep * SEPARATION_WEIGHT;
+                    if desired_vel_xz.length() > flee_spd {
+                        desired_vel_xz = desired_vel_xz.normalize() * flee_spd;
+                    }
+                }
                 AllyState::Regroup => {
                     ally.regroup_timer += dt;
                     if dist_to_player <= REGROUP_SAFE_DIST && ally.stuck_timer < 0.5 {
@@ -611,7 +1208,6 @@ impl Squad {
                     } else if ally.regroup_timer >= REGROUP_TELEPORT_TIME
                         && dist_to_player > REGROUP_SAFE_DIST
                     {
-                        // Teleport next to player at formation slot with flash
                         let mut tp = ally.slot_pos;
                         tp.y = 0.0;
                         let mut dv = Vec3::ZERO;
@@ -650,7 +1246,7 @@ impl Squad {
                     }
                 }
                 AllyState::Follow => {
-                    if ally.target_enemy_id.is_some() {
+                    if ally.target_enemy_id.is_some() && !refuses_fights {
                         ally.state = AllyState::Engage;
                     } else {
                         let home_3d = if self.mode == SquadMode::Hold {
@@ -757,7 +1353,7 @@ impl Squad {
                                     out.hits[out.hit_count] = AllyAttackHit {
                                         ally_id: ally.id,
                                         enemy_id: enemy.id,
-                                        damage: ally.rarity.damage(),
+                                        damage: ally.effective_damage(),
                                         attacker_pos: ally.pos,
                                     };
                                     out.hit_count += 1;
@@ -772,14 +1368,14 @@ impl Squad {
                 AllyState::Recover => {
                     ally.state_timer -= dt;
                     if ally.state_timer <= 0.0 {
-                        if ally.target_enemy_id.is_some() {
+                        if ally.target_enemy_id.is_some() && !refuses_fights {
                             ally.state = AllyState::Engage;
                         } else {
                             ally.state = AllyState::Follow;
                         }
                     }
                 }
-                AllyState::Down => {}
+                AllyState::Freeze | AllyState::Down => {}
             }
 
             ally.vel.x = desired_vel_xz.x;
@@ -851,6 +1447,11 @@ impl Squad {
     }
 }
 
+#[inline]
+fn enemy_or_path_len(path: &[Vec2]) -> usize {
+    path.len()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -861,12 +1462,10 @@ mod tests {
         let mut squad = Squad::new(12345);
         let mut score = 20u32;
 
-        // Insufficient score (< 30) fails and does not spend score
         assert!(!squad.try_summon(&mut score, Vec3::ZERO, 0.0, &grid, 1, 0));
         assert_eq!(score, 20);
         assert_eq!(squad.status_message, "Not enough score");
 
-        // Summon 4 allies with sufficient score
         score = 150;
         for _ in 0..MAX_ALLIES {
             assert!(squad.try_summon(&mut score, Vec3::ZERO, 0.0, &grid, 1, 0));
@@ -874,7 +1473,6 @@ mod tests {
         assert_eq!(squad.allies.len(), MAX_ALLIES);
         assert_eq!(score, 30);
 
-        // 5th summon fails with "Squad full" and does not spend the remaining 30 score
         assert!(!squad.try_summon(&mut score, Vec3::ZERO, 0.0, &grid, 1, 0));
         assert_eq!(score, 30);
         assert_eq!(squad.status_message, "Squad full");
@@ -890,7 +1488,6 @@ mod tests {
                 assert!(slots_yaw0[i].distance(slots_yaw0[j]) > 1.0);
             }
         }
-
         let slots_yaw90: Vec<Vec3> = (0..4)
             .map(|i| compute_formation_slot(p, std::f32::consts::FRAC_PI_2, i))
             .collect();
@@ -908,7 +1505,6 @@ mod tests {
 
         let enemies = vec![e_passive_near, e_attacker_far];
 
-        // Prefers enemy 2 (attacker) over closer passive enemy 1
         let chosen = select_ally_target(
             Vec3::ZERO,
             Vec3::ZERO,
@@ -920,7 +1516,6 @@ mod tests {
         );
         assert_eq!(chosen, Some(2));
 
-        // Stickiness: if locked onto enemy 1 with lock_timer = 0.5s (< 1.5s), keeps enemy 1
         let sticky = select_ally_target(
             Vec3::ZERO,
             Vec3::ZERO,
@@ -942,7 +1537,6 @@ mod tests {
         let mut score = 60;
         assert!(squad.try_summon(&mut score, Vec3::ZERO, 0.0, &grid, 1, 0));
 
-        // Damage ally to 0 HP -> becomes Down
         squad.allies[0].apply_damage(500.0);
         assert!(squad.allies[0].is_down());
         let ally_pos = squad.allies[0].pos;
@@ -950,25 +1544,21 @@ mod tests {
         let granted = [false; MAX_ALLIES];
         let dt = 0.5;
 
-        // Hold E for 1.0s within range -> progress increases to 1.0s
         for _ in 0..2 {
             squad.update(dt, ally_pos, 0.0, 1.0, true, &[], &[], &granted, &grid, &nav, &mut nav_scratch);
         }
         assert!(squad.allies[0].is_down());
         assert!((squad.allies[0].revive_progress - 1.0).abs() < 1e-4);
 
-        // Release E -> progress resets to 0.0
         squad.update(dt, ally_pos, 0.0, 1.0, false, &[], &[], &granted, &grid, &nav, &mut nav_scratch);
         assert_eq!(squad.allies[0].revive_progress, 0.0);
 
-        // Hold E for full 2.0s within range -> revives with 50% health
         for _ in 0..4 {
             squad.update(dt, ally_pos, 0.0, 1.0, true, &[], &[], &granted, &grid, &nav, &mut nav_scratch);
         }
         assert!(squad.allies[0].is_living());
         assert!((squad.allies[0].health - squad.allies[0].max_health * 0.5).abs() < 1e-3);
 
-        // Down again and test wave-start auto-revive
         squad.allies[0].apply_damage(500.0);
         assert!(squad.allies[0].is_down());
         let revived = squad.revive_all_down_for_new_wave();
@@ -985,14 +1575,12 @@ mod tests {
         let mut score = 60;
         squad.try_summon(&mut score, Vec3::ZERO, 0.0, &grid, 1, 0);
 
-        // Place ally 26m away (> REGROUP_DISTANCE = 22m) and force Regroup state
         squad.allies[0].pos = Vec3::new(26.0, 0.0, 0.0);
         squad.allies[0].state = AllyState::Regroup;
         squad.allies[0].regroup_timer = 5.95;
 
         let granted = [false; MAX_ALLIES];
         squad.update(0.1, Vec3::ZERO, 0.0, 1.0, false, &[], &[], &granted, &grid, &nav, &mut nav_scratch);
-        // Teleported next to player (~3.0m formation slot)
         assert!(squad.allies[0].pos.distance(Vec3::ZERO) <= FOLLOW_DISTANCE + 0.5);
         assert_eq!(squad.allies[0].state, AllyState::Follow);
     }
@@ -1007,11 +1595,9 @@ mod tests {
         squad.try_summon(&mut score, Vec3::ZERO, 0.0, &grid, 1, 0);
         squad.allies[0].pos = Vec3::new(10.0, 0.0, 10.0);
 
-        // Set Hold mode -> hold_pos locked to (10, 0, 10)
         squad.set_mode(SquadMode::Hold);
         assert_eq!(squad.allies[0].hold_pos, Vec3::new(10.0, 0.0, 10.0));
 
-        // Displace ally to (12, 0, 10) with no enemies -> walks back toward hold_pos (10, 0, 10)
         squad.allies[0].pos = Vec3::new(12.0, 0.0, 10.0);
         let granted = [false; MAX_ALLIES];
         for _ in 0..60 {
@@ -1019,7 +1605,6 @@ mod tests {
         }
         assert!(squad.allies[0].pos.distance(Vec3::new(10.0, 0.0, 10.0)) < 1.0);
 
-        // Aggressive mode targets an enemy 25m away (> 14m normal aggro, <= 30m aggressive aggro)
         squad.set_mode(SquadMode::Aggressive);
         let far_enemy = Enemy::new(9, Vec3::new(10.0, 0.0, -14.0), 1, 1, 0);
         let enemies = vec![far_enemy];
@@ -1028,47 +1613,8 @@ mod tests {
     }
 
     #[test]
-    fn test_ally_skill_rules_common_rare_and_epic_heal_priority() {
-        let grid = CollisionGrid::new(Vec::new());
-        let nav = NavGrid::new(&[]);
-        let mut nav_scratch = NavSearchScratch::new();
-        let granted = [false; MAX_ALLIES];
-        let enemies = vec![Enemy::new(1, Vec3::new(0.0, 0.0, -8.0), 1, 1, 0)];
-
-        let mut squad = Squad::new(101);
-        squad.allies.push(Ally::new(1, "CommonOne", Rarity::Common, Vec3::ZERO, 0.0, 1, 0));
-        squad.allies[0].state = AllyState::Engage;
-        squad.allies[0].target_enemy_id = Some(1);
-
-        // Common ally never casts skills
-        let out_c = squad.update(1.0 / 60.0, Vec3::ZERO, 0.0, 0.3, false, &enemies, &[], &granted, &grid, &nav, &mut nav_scratch);
-        assert_eq!(out_c.skill_cast_count, 0);
-
-        // Rare ally casts Fireball when target is between 4m and 14m with LOS
-        squad.allies[0].rarity = Rarity::Rare;
-        squad.allies[0].state = AllyState::Engage;
-        let out_r = squad.update(1.0 / 60.0, Vec3::ZERO, 0.0, 1.0, false, &enemies, &[], &granted, &grid, &nav, &mut nav_scratch);
-        assert_eq!(out_r.skill_cast_count, 1);
-        assert!(matches!(out_r.skill_casts[0], Some(AllySkillCast::Fireball { .. })));
-        assert!((squad.allies[0].fireball_cd - RARE_FIREBALL_COOLDOWN).abs() < 1e-4);
-        assert_eq!(squad.allies[0].state, AllyState::Recover);
-
-        // Epic ally prioritizes Heal Pulse over Fireball when player is below 50% HP (player_hp_ratio = 0.4)
-        squad.allies[0].rarity = Rarity::Epic;
-        squad.allies[0].state = AllyState::Engage;
-        squad.allies[0].fireball_cd = 0.0;
-        squad.allies[0].heal_cd = 0.0;
-        let out_e = squad.update(1.0 / 60.0, Vec3::ZERO, 0.0, 0.4, false, &enemies, &[], &granted, &grid, &nav, &mut nav_scratch);
-        assert_eq!(out_e.skill_cast_count, 1);
-        assert!(matches!(out_e.skill_casts[0], Some(AllySkillCast::HealPulse { .. })));
-        assert!((squad.allies[0].heal_cd - EPIC_HEAL_COOLDOWN).abs() < 1e-4);
-        assert_eq!(squad.allies[0].fireball_cd, 0.0);
-    }
-
-    #[test]
     fn test_shared_astar_budget_round_robin_fairness() {
         let mut sched = AstarBudgetScheduler::new();
-        // 10 enemies + 4 allies = 14 actors all requesting A* simultaneously
         let requests = [true; 14];
         let mut granted = [false; 14];
         let mut served_counts = [0u32; 14];
@@ -1084,10 +1630,82 @@ mod tests {
                 }
             }
         }
-
-        // Across 5 steps (15 total grants for 14 actors), every single actor was served at least once!
         for &c in &served_counts {
             assert!(c >= 1);
         }
+    }
+
+    #[test]
+    fn test_ally_skill_rules_common_rare_and_epic_heal_priority() {
+        let grid = CollisionGrid::new(Vec::new());
+        let nav = NavGrid::new(&[]);
+        let mut nav_scratch = NavSearchScratch::new();
+        let granted = [false; MAX_ALLIES];
+        let enemies = vec![Enemy::new(1, Vec3::new(0.0, 0.0, -8.0), 1, 1, 0)];
+
+        let mut squad = Squad::new(101);
+        squad.allies.push(Ally::new(1, "CommonOne", Rarity::Common, Vec3::ZERO, 0.0, 1, 0));
+        squad.allies[0].state = AllyState::Engage;
+        squad.allies[0].target_enemy_id = Some(1);
+
+        let out_c = squad.update(1.0 / 60.0, Vec3::ZERO, 0.0, 0.3, false, &enemies, &[], &granted, &grid, &nav, &mut nav_scratch);
+        assert_eq!(out_c.skill_cast_count, 0);
+
+        squad.allies[0].rarity = Rarity::Rare;
+        squad.allies[0].state = AllyState::Engage;
+        let out_r = squad.update(1.0 / 60.0, Vec3::ZERO, 0.0, 1.0, false, &enemies, &[], &granted, &grid, &nav, &mut nav_scratch);
+        assert_eq!(out_r.skill_cast_count, 1);
+        assert!(matches!(out_r.skill_casts[0], Some(AllySkillCast::Fireball { .. })));
+
+        squad.allies[0].rarity = Rarity::Epic;
+        squad.allies[0].state = AllyState::Engage;
+        squad.allies[0].fireball_cd = 0.0;
+        squad.allies[0].heal_cd = 0.0;
+        let out_e = squad.update(1.0 / 60.0, Vec3::ZERO, 0.0, 0.4, false, &enemies, &[], &granted, &grid, &nav, &mut nav_scratch);
+        assert_eq!(out_e.skill_cast_count, 1);
+        assert!(matches!(out_e.skill_casts[0], Some(AllySkillCast::HealPulse { .. })));
+    }
+
+    #[test]
+    fn test_camp_quarrel_stopped_by_fairy_and_starvation_feeding() {
+        let grid = CollisionGrid::new(Vec::new());
+        let nav = NavGrid::new(&[]);
+        let mut nav_scratch = NavSearchScratch::new();
+        let granted = [false; MAX_ALLIES];
+
+        let mut squad = Squad::new(202);
+        let p_camp = crate::camp::CAMP_CENTER;
+        squad.allies.push(Ally::new(1, "A", Rarity::Common, p_camp, 0.0, 1, 0));
+        squad.allies.push(Ally::new(2, "B", Rarity::Common, p_camp, 0.0, 1, 0));
+
+        // Start a quarrel and fairy intervention
+        squad.allies[0].pre_quarrel_hp = 60.0;
+        squad.allies[0].health = 45.0;
+        squad.allies[0].only_quarrel_damage = true;
+        squad.allies[0].camp_activity = CampActivity::Quarrel;
+        squad.allies[0].activity_timer = 6.0;
+        squad.allies[1].camp_activity = CampActivity::Quarrel;
+        squad.allies[1].activity_timer = 6.0;
+        squad.fairy.start_quarrel_intervention(1, 2, p_camp);
+
+        // Run camp phase for 2.6s -> fairy arrives, restores health to 60, sets scolded_timer = 10s
+        for _ in 0..26 {
+            squad.update_camp_phase(0.1, Vec3::ZERO, false, &[], &granted, &grid, &nav, &mut nav_scratch);
+        }
+        assert!(!squad.fairy.is_active());
+        assert_eq!(squad.allies[0].camp_activity, CampActivity::Idle);
+        assert!((squad.allies[0].health - 60.0).abs() < 1e-3);
+        assert!(squad.allies[0].needs.scolded_timer > 8.0);
+
+        // Starvation feeding: ally at hunger 100 for 10s with food > 0 triggers fairy feed
+        squad.allies[0].needs.hunger = 100.0;
+        squad.allies[0].needs.starving_at_100_timer = 10.5;
+        squad.food_stock = 3;
+        squad.update_camp_phase(0.1, Vec3::ZERO, false, &[], &granted, &grid, &nav, &mut nav_scratch);
+        assert!(squad.fairy.is_active());
+        for _ in 0..26 {
+            squad.update_camp_phase(0.1, Vec3::ZERO, false, &[], &granted, &grid, &nav, &mut nav_scratch);
+        }
+        assert!(squad.allies[0].needs.hunger < 50.0);
     }
 }

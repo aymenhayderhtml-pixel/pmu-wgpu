@@ -1,9 +1,10 @@
-# PMU (Pick Me Up) — Phase 9 Architecture
+# PMU (Pick Me Up) — Phase 10 Architecture
 
 ## Module Map
-- `src/main.rs`, `src/app.rs`, `src/game_flow.rs`, `src/input.rs`, `src/camera.rs`: Entry point, `GameFlow` (`MainMenu`, `Playing`, `PauseMenu`, `SkillMenu`, `GameOver`), mouse/keyboard routing, F1–F10 hotkeys, and third-person/menu-orbit camera.
-- `src/save.rs`, `src/settings.rs`: Hand-written key=value `SaveData` parser/writer with FNV-1a 64-bit checksum, atomic `.tmp` -> `.bak` -> `.sav` persistence in `saves/`, UTC date formatter, and tolerant `settings.cfg` persistence.
-- `src/menu.rs`, `src/hud_menu.rs`: Stack-based `MenuSystem` (`Main`, `Pause`, `SaveSlots`, `LoadSlots`, `Settings`, `Controls`, `GameOver`, `Confirm`), pure `layout()` rect calculator, mouse hover/click hit-testing, and 0.2s transition fade overlay.
+- `src/main.rs`, `src/app.rs`, `src/game_flow.rs`, `src/input.rs`, `src/camera.rs`: Entry point, `GameFlow` (`MainMenu`, `Playing`, `PauseMenu`, `SkillMenu`, `SquadScreen`, `LoginReport`, `GameOver`), mouse/keyboard routing, and camera.
+- `src/traits.rs`, `src/life.rs`, `src/camp.rs`, `src/training.rs`, `src/fairy.rs`, `src/offline.rs`: Ally life-sim layer: Fighter/Archer classes, personality traits, levels 1–10 & passive skills (`Basic Sword-Shield` combining, `Pain Tolerance`), hunger/fear/fatigue & `Flee`/`Freeze`, cube-free Camp (`-20, 0, -20`) with 5 objects & 45s Camp phase, training/sparring/quarrels, Fairy intervention, and offline Login Progress Report (capped at 8h in 10m ticks).
+- `src/save.rs`, `src/settings.rs`: Save v2 (with v1 backward compatibility) and `settings.cfg` persistence.
+- `src/menu.rs`, `src/hud_menu.rs`, `src/hud_life.rs`, `src/hud_squad.rs`, `src/hud.rs`: Menus, `SquadScreen` (`H`), `LoginReport` (`WELCOME BACK`), camp banner (`N: skip`), and world-space activity icons.
 - `src/collision.rs`, `src/nav.rs`, `src/combat.rs`, `src/status.rs`: 4m spatial collision grid, 60x60 A* navigation grid, player combat/dodge, and Burn/Slow status effects.
 - `src/skills.rs`, `src/skill_inv.rs`, `src/skill_menu.rs`, `src/projectiles.rs`, `src/pickups.rs`, `src/effects.rs`: 9-skill table, inventory/fusion, K-key grimoire, projectiles, skill orbs, and 64-entry priority `EffectsPool`.
 - `src/ally.rs`: `Ally`, `Rarity` gacha roll (70% Common, 25% Rare, 5% Epic), rarity stats/tints/name pools, `AllyState`, spawn ease-out + flash, and unit tests.
@@ -64,11 +65,18 @@
 | `SkillMenu` | Frozen | Frozen | Closes Grimoire -> `Playing` | Assign slots `1..4`, Clear (`Backspace`), Fuse (`Enter`/`T`) |
 | `GameOver` | Frozen | Frozen | Pops sub-screen | `Retry`, `LoadLast`, `BackToMainMenu` |
 
+## Camp Activities, Traits, Passive Skills & Save v2 Keys
+- **Camp Zone & Phase**: Cube-free `12x12m` square at `(-20, 0, -20)` with Dummy (cap 2), Archery Target (cap 2), Food Pot (cap 3), Rest Mat (cap 2), and Flag Post (cap 2). Clearing a wave starts a `45s` Camp phase (autosaved at start; `N` skips to next wave).
+- **Camp Activities**: `Eat` (`4s`, `-60` hunger, `-1` food), `Rest` (`12s`, `+6% HP/s`, `-8 fatigue/s`, tracks `Pain Tolerance`), `Train` (`10s`, `+25` fatigue, 15/70/15 roll for 0x/1x/2x XP + passive progress, 1% death risk on great roll if `<70%` HP or `>70` fatigue), `Spar` (`8s`, non-lethal hits, `+20` XP, 25% quarrel escalation when hungry/scared/hotheaded), `Idle` (`3s`).
+- **Traits & Passives**: `Brave`/`Cautious` (fear threshold `80`/`45`, normal `60`), `Diligent`/`Lazy` (`+0.3`/`-0.3` train score, `+10` XP), `Hotheaded`/`Calm` (`+0.25`/`-0.15` spar score), `HungryType`/`LightEater` (`1.3x`/`0.7x` hunger rate). Passives (`Lv1..5`): `Basic Swordsmanship` (`+6%` dmg), `Basic Archery` (`+6%` dmg), `Basic Shield` (`-4%` dmg taken), `Pain Tolerance` (`+6%` max HP, 1 pt per 150 dmg healed by resting), and `Basic Sword-Shield` (combines Sword Lv2 + Shield Lv2 into Lv3, `+5%` dmg & `-4%` dmg taken/lvl).
+- **Save v2 Keys**: Adds `squad.food` and `ally.N.{class,trait0,trait1,level,xp,hunger,fear,fatigue,passive.0..4.level,passive.0..4.prog,pain.dmg,pain.healed,pain.points}`, plus `progress.phase=Camp`.
+
 ## Controls Table
 | Input | Action |
 | :--- | :--- |
 | `Left Click` / `C` / `Space` / `Shift` | Melee Attack (or Menu Click) / Dodge Roll / Jump / Sprint |
 | `Q` / `F` / `X` / `V` / `T` / `K` | Cast Skill Slots 1–4 / Quick-Fuse / Skill Grimoire Menu |
+| `H` / `N` | Open/Close Squad Life & Training Screen / Skip 45s Camp Phase |
 | `G` / `E` (hold) / `1`..`3` | Summon Ally (`30` score) / Revive Down Ally / Squad Mode (`Follow`/`Hold`/`Aggressive`) |
 | `F1`..`F8` / `F9` / `F10` / `R` / `Delete` / `Escape` | Benchmark & Debug Tools / Quicksave / Quickload / Restart / Delete Save Slot / Pause or Back |
 

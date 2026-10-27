@@ -1,3 +1,4 @@
+use crate::camp::{overlaps_camp_zone, CAMP_PHASE_DURATION};
 use crate::collision::CollisionGrid;
 use crate::enemy::{Enemy, ENEMY_HEIGHT, ENEMY_RADIUS};
 use crate::nav::NavGrid;
@@ -7,13 +8,21 @@ pub const WAVE_1_ENEMIES: u32 = 3;
 pub const WAVE_INCREMENT: u32 = 2;
 pub const MAX_ALIVE_ENEMIES: usize = 12;
 pub const MIN_SPAWN_DIST_FROM_PLAYER: f32 = 25.0;
-pub const WAVE_INTERMISSION_TIME: f32 = 4.0;
+pub const WAVE_INTERMISSION_TIME: f32 = CAMP_PHASE_DURATION;
 pub const KILL_SCORE: u32 = 10;
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum WaveTransition {
+    None,
+    EnteredCamp,
+    StartedNextWave,
+}
 
 pub struct WaveManager {
     pub current_wave: u32,
     pub pending_spawns: u32,
     pub intermission_timer: f32,
+    pub in_camp: bool,
     pub score: u32,
     next_enemy_id: u32,
     rng_state: u64,
@@ -25,6 +34,7 @@ impl WaveManager {
             current_wave: 1,
             pending_spawns: Self::enemies_for_wave_with_allies(1, 0),
             intermission_timer: 0.0,
+            in_camp: false,
             score: 0,
             next_enemy_id: 1,
             rng_state: seed ^ 0xA5A5_5A5A_F0F0_0F0F,
@@ -39,11 +49,35 @@ impl WaveManager {
         self.rng_state
     }
 
+    pub fn camp_remaining(&self) -> f32 {
+        if self.in_camp {
+            (WAVE_INTERMISSION_TIME - self.intermission_timer).max(0.0)
+        } else {
+            0.0
+        }
+    }
+
+    pub fn skip_camp(&mut self, living_allies: u32) -> bool {
+        if !self.in_camp {
+            return false;
+        }
+        self.in_camp = false;
+        self.intermission_timer = 0.0;
+        self.current_wave += 1;
+        self.pending_spawns = Self::enemies_for_wave_with_allies(self.current_wave, living_allies);
+        println!(
+            "Camp skipped (N) -> Wave {} started! Spawning {} enemies.",
+            self.current_wave, self.pending_spawns
+        );
+        true
+    }
+
     pub fn restore_state(
         &mut self,
         current_wave: u32,
         pending_spawns: u32,
         intermission_timer: f32,
+        in_camp: bool,
         score: u32,
         rng_state: u64,
         next_enemy_id: u32,
@@ -51,6 +85,7 @@ impl WaveManager {
         self.current_wave = current_wave.max(1);
         self.pending_spawns = pending_spawns;
         self.intermission_timer = intermission_timer.max(0.0);
+        self.in_camp = in_camp;
         self.score = score;
         self.rng_state = rng_state;
         self.next_enemy_id = next_enemy_id.max(1);
@@ -65,7 +100,6 @@ impl WaveManager {
         self.score += KILL_SCORE;
     }
 
-    /// Updates wave spawning and returns `true` if a new wave just started this step.
     pub fn update(
         &mut self,
         dt: f32,
@@ -76,51 +110,57 @@ impl WaveManager {
         nav: &NavGrid,
         skeleton_node_count: usize,
         initial_clip: usize,
-    ) -> bool {
-        let mut started_new_wave = false;
-        let alive_count = enemies.iter().filter(|e| e.is_alive()).count();
+    ) -> WaveTransition {
+        if !self.in_camp {
+            while self.pending_spawns > 0 && enemies.len() < MAX_ALIVE_ENEMIES {
+                let spawn_pos =
+                    pick_enemy_spawn_point(&mut self.rng_state, player_pos, collision, nav);
+                let id = self.next_enemy_id;
+                self.next_enemy_id = self.next_enemy_id.wrapping_add(1);
+                let enemy_seed = self.rng_state ^ (u64::from(id) * 0x9E37_79B9_7F4A_7C15);
 
-        while self.pending_spawns > 0 && enemies.len() < MAX_ALIVE_ENEMIES {
-            let spawn_pos =
-                pick_enemy_spawn_point(&mut self.rng_state, player_pos, collision, nav);
-            let id = self.next_enemy_id;
-            self.next_enemy_id = self.next_enemy_id.wrapping_add(1);
-            let enemy_seed = self.rng_state ^ (u64::from(id) * 0x9E37_79B9_7F4A_7C15);
-
-            let mut enemy = Enemy::new(
-                id,
-                spawn_pos,
-                enemy_seed,
-                skeleton_node_count,
-                initial_clip,
-            );
-            let to_player = Vec2::new(player_pos.x - spawn_pos.x, player_pos.z - spawn_pos.z);
-            if to_player.length_squared() > 1e-4 {
-                enemy.yaw = f32::atan2(-to_player.x, -to_player.y);
-                enemy.prev_yaw = enemy.yaw;
+                let mut enemy = Enemy::new(
+                    id,
+                    spawn_pos,
+                    enemy_seed,
+                    skeleton_node_count,
+                    initial_clip,
+                );
+                let to_player = Vec2::new(player_pos.x - spawn_pos.x, player_pos.z - spawn_pos.z);
+                if to_player.length_squared() > 1e-4 {
+                    enemy.yaw = f32::atan2(-to_player.x, -to_player.y);
+                    enemy.prev_yaw = enemy.yaw;
+                }
+                enemies.push(enemy);
+                self.pending_spawns -= 1;
             }
-            enemies.push(enemy);
-            self.pending_spawns -= 1;
-        }
 
-        if self.pending_spawns == 0 && alive_count == 0 {
-            self.intermission_timer += dt;
-            if self.intermission_timer >= WAVE_INTERMISSION_TIME {
+            let current_alive = enemies.iter().filter(|e| e.is_alive()).count();
+            if self.pending_spawns == 0 && current_alive == 0 {
+                self.in_camp = true;
                 self.intermission_timer = 0.0;
-                self.current_wave += 1;
-                self.pending_spawns = Self::enemies_for_wave_with_allies(
-                    self.current_wave,
-                    living_allies_if_regenerated,
-                );
-                started_new_wave = true;
-                println!(
-                    "Wave {} started! Spawning {} enemies (living allies: {}).",
-                    self.current_wave, self.pending_spawns, living_allies_if_regenerated
-                );
+                return WaveTransition::EnteredCamp;
             }
+            return WaveTransition::None;
         }
 
-        started_new_wave
+        self.intermission_timer += dt;
+        if self.intermission_timer >= WAVE_INTERMISSION_TIME {
+            self.in_camp = false;
+            self.intermission_timer = 0.0;
+            self.current_wave += 1;
+            self.pending_spawns = Self::enemies_for_wave_with_allies(
+                self.current_wave,
+                living_allies_if_regenerated,
+            );
+            println!(
+                "Wave {} started! Spawning {} enemies (living allies: {}).",
+                self.current_wave, self.pending_spawns, living_allies_if_regenerated
+            );
+            return WaveTransition::StartedNextWave;
+        }
+
+        WaveTransition::None
     }
 }
 
@@ -141,6 +181,9 @@ pub fn pick_enemy_spawn_point(
         if cand.distance_squared(player_xz) < min_dist_sq {
             continue;
         }
+        if overlaps_camp_zone(rx, rz, ENEMY_RADIUS + 0.5) {
+            continue;
+        }
         let (cx, cz) = NavGrid::world_to_cell(cand);
         if !nav.is_blocked(cx, cz) && collision.is_circle_free(rx, rz, clearance, ENEMY_HEIGHT) {
             return Vec3::new(rx, 0.0, rz);
@@ -154,6 +197,7 @@ pub fn pick_enemy_spawn_point(
             let z = (player_pos.z + r * angle.sin()).clamp(-28.5, 28.5);
             let cand = Vec2::new(x, z);
             if cand.distance_squared(player_xz) >= min_dist_sq
+                && !overlaps_camp_zone(x, z, ENEMY_RADIUS + 0.5)
                 && collision.is_circle_free(x, z, clearance, ENEMY_HEIGHT)
             {
                 return Vec3::new(x, 0.0, z);
@@ -201,7 +245,25 @@ mod tests {
             let p = pick_enemy_spawn_point(&mut seed, player_pos, &grid, &nav);
             let dist = Vec2::new(p.x, p.z).distance(Vec2::ZERO);
             assert!(dist >= MIN_SPAWN_DIST_FROM_PLAYER - 1e-3);
+            assert!(!overlaps_camp_zone(p.x, p.z, ENEMY_RADIUS));
             assert!(grid.is_circle_free(p.x, p.z, ENEMY_RADIUS, ENEMY_HEIGHT));
         }
+
+        // Test wave -> Camp phase -> Skip / Timer end -> Next wave state machine
+        let mut wm = WaveManager::new(42);
+        wm.pending_spawns = 0;
+        let mut enemies = Vec::new();
+        assert_eq!(
+            wm.update(0.1, &mut enemies, Vec3::ZERO, 2, &grid, &nav, 1, 0),
+            WaveTransition::EnteredCamp
+        );
+        assert!(wm.in_camp);
+        assert!((wm.camp_remaining() - CAMP_PHASE_DURATION).abs() < 1e-4);
+
+        // N skip transitions immediately to Wave 2 with 5 + 2 = 7 pending enemies
+        assert!(wm.skip_camp(2));
+        assert!(!wm.in_camp);
+        assert_eq!(wm.current_wave, 2);
+        assert_eq!(wm.pending_spawns, 7);
     }
 }

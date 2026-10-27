@@ -510,8 +510,14 @@ fn format_slot_row(slot_idx: usize, status: &SlotStatus, out: &mut String) {
             let pt_str = format_playtime_hms(info.playtime_seconds);
             let _ = write!(
                 out,
-                "{:<9} | {} | Wv:{} Scr:{} | {} | Allies:{}",
-                title, dt_str, info.wave, info.score, pt_str, info.ally_count
+                "{:<8} | {} | Wv:{} Scr:{} | {} | Al:{}(Lv{})",
+                title,
+                dt_str,
+                info.wave,
+                info.score,
+                pt_str,
+                info.ally_count,
+                info.avg_ally_level
             );
         }
     }
@@ -578,6 +584,7 @@ mod tests {
             score: 40,
             playtime_seconds: 90.0,
             ally_count: 1,
+            avg_ally_level: 2,
         });
         menu.open_root(MenuScreen::Main, &cfg, &with_save);
         assert!(menu.items[0].enabled);
@@ -602,6 +609,7 @@ mod tests {
             score: 10,
             playtime_seconds: 15.0,
             ally_count: 0,
+            avg_ally_level: 0,
         });
 
         let mut menu = MenuSystem::new();

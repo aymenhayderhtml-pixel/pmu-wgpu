@@ -172,14 +172,23 @@ impl App {
         }
     }
 
-    fn load_from_slot(&mut self, slot_idx: usize) {
+    fn load_from_slot(&mut self, slot_idx: usize, compute_offline: bool) {
         let file_name = SLOT_FILES[slot_idx % SLOT_FILES.len()];
         match load_save_with_backup(&self.base_dir, file_name) {
             Ok((data, used_bak)) => {
-                self.world.apply_save(&data);
+                if compute_offline {
+                    let now_secs = crate::save::current_unix_seconds();
+                    self.world.apply_save_with_offline(&data, now_secs);
+                } else {
+                    self.world.apply_save(&data);
+                }
                 self.camera.focus = self.world.player.pos;
                 self.camera.in_main_menu_orbit = false;
                 self.fade_timer = TRANSITION_FADE_DURATION;
+                if self.world.autosave_requested {
+                    self.world.autosave_requested = false;
+                    self.save_to_slot(3, "Autosaved");
+                }
                 self.save_statuses = list_saves(&self.base_dir);
                 let msg = if used_bak {
                     "Game loaded (restored from backup)"
@@ -203,9 +212,10 @@ impl App {
         match action {
             MenuAction::None => {}
             MenuAction::Continue | MenuAction::LoadLast => {
+                let from_main = self.world.game_flow == GameFlow::MainMenu;
                 self.save_statuses = list_saves(&self.base_dir);
                 if let Some(slot_idx) = most_recent_save_slot(&self.save_statuses) {
-                    self.load_from_slot(slot_idx);
+                    self.load_from_slot(slot_idx, from_main);
                 }
             }
             MenuAction::NewGame => {
@@ -259,7 +269,8 @@ impl App {
                 self.save_to_slot(slot, "Game saved");
             }
             MenuAction::LoadSlot(slot) => {
-                self.load_from_slot(slot);
+                let from_main = self.world.game_flow == GameFlow::MainMenu;
+                self.load_from_slot(slot, from_main);
             }
             MenuAction::DeleteSlot(slot) => {
                 let file_name = SLOT_FILES[slot % SLOT_FILES.len()];
@@ -376,6 +387,31 @@ impl App {
             }
         }
 
+        if matches!(prev_flow, GameFlow::Playing | GameFlow::SquadScreen)
+            && self.input.take_just_pressed(KeyCode::KeyH)
+        {
+            self.world.game_flow = self.world.game_flow.on_toggle_squad_screen();
+            if self.world.game_flow == GameFlow::SquadScreen && self.mouse_captured {
+                self.set_mouse_capture(false);
+            }
+        }
+        if matches!(prev_flow, GameFlow::Playing | GameFlow::SquadScreen)
+            && self.input.take_just_pressed(KeyCode::KeyH)
+        {
+            self.world.game_flow = self.world.game_flow.on_toggle_squad_screen();
+            if self.world.game_flow == GameFlow::SquadScreen && self.mouse_captured {
+                self.set_mouse_capture(false);
+            }
+        }
+        if matches!(prev_flow, GameFlow::Playing | GameFlow::SquadScreen)
+            && self.input.take_just_pressed(KeyCode::KeyH)
+        {
+            self.world.game_flow = self.world.game_flow.on_toggle_squad_screen();
+            if self.world.game_flow == GameFlow::SquadScreen && self.mouse_captured {
+                self.set_mouse_capture(false);
+            }
+        }
+
         if matches!(prev_flow, GameFlow::Playing | GameFlow::SkillMenu)
             && !self.world.combat.is_dead()
             && self.input.take_just_pressed(KeyCode::KeyT)
@@ -459,12 +495,38 @@ impl App {
                 let _ = self.input.take_mouse_delta();
                 let _ = self.input.take_attack_requested();
             }
+            GameFlow::SquadScreen => {
+                let count = self.world.squad.allies.len().max(1);
+                if self.input.take_just_pressed(KeyCode::ArrowUp) {
+                    self.world.squad.selected_ally_idx =
+                        (self.world.squad.selected_ally_idx + count - 1) % count;
+                }
+                if self.input.take_just_pressed(KeyCode::ArrowDown) {
+                    self.world.squad.selected_ally_idx =
+                        (self.world.squad.selected_ally_idx + 1) % count;
+                }
+                let _ = self.input.take_mouse_delta();
+                let _ = self.input.take_attack_requested();
+            }
+            GameFlow::LoginReport => {
+                if self.input.take_just_pressed(KeyCode::Enter)
+                    || self.input.take_just_pressed(KeyCode::Space)
+                {
+                    self.world.login_report = None;
+                    self.world.game_flow = GameFlow::Playing;
+                }
+                let _ = self.input.take_mouse_delta();
+                let _ = self.input.take_attack_requested();
+            }
             GameFlow::Playing => {
                 if self.input.take_just_pressed(KeyCode::F9) {
                     self.save_to_slot(4, "Game saved");
                 }
                 if self.input.take_just_pressed(KeyCode::F10) {
-                    self.load_from_slot(4);
+                    self.load_from_slot(4, false);
+                }
+                if self.input.take_just_pressed(KeyCode::KeyN) {
+                    self.world.skip_camp_phase();
                 }
                 if self.input.take_just_pressed(KeyCode::KeyG) && !self.world.combat.is_dead() {
                     self.world.summon_ally();
@@ -606,6 +668,13 @@ impl App {
                 fade_alpha,
                 total_kills: self.world.total_kills,
                 ally_casts: self.world.squad.total_ally_casts,
+                in_camp_phase: self.world.waves.in_camp,
+                camp_timer: self.world.waves.camp_remaining(),
+                food_stock: self.world.squad.food_stock,
+                camp_activity_counts: self.world.squad.camp_activity_counts(),
+                fairy_state: self.world.squad.fairy.state_label(),
+                selected_ally_idx: self.world.squad.selected_ally_idx,
+                login_report: self.world.login_report.as_ref(),
                 status_message: &self.world.squad.status_message,
                 status_color: self.world.squad.status_color,
                 status_timer: self.world.squad.status_timer,
@@ -762,6 +831,9 @@ impl ApplicationHandler for App {
                         );
                         self.execute_menu_action(act, event_loop);
                     }
+                } else if self.world.game_flow == GameFlow::LoginReport {
+                    self.world.login_report = None;
+                    self.world.game_flow = GameFlow::Playing;
                 } else if self.world.game_flow == GameFlow::Playing {
                     if !self.mouse_captured {
                         self.set_mouse_capture(true);
@@ -790,6 +862,10 @@ impl ApplicationHandler for App {
                         }
                         GameFlow::SkillMenu => {
                             self.world.menu.close(&mut self.world.game_flow);
+                        }
+                        GameFlow::SquadScreen | GameFlow::LoginReport => {
+                            self.world.login_report = None;
+                            self.world.game_flow = GameFlow::Playing;
                         }
                         GameFlow::PauseMenu => {
                             if !self

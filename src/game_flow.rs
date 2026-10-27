@@ -4,6 +4,8 @@ pub enum GameFlow {
     Playing,
     PauseMenu,
     SkillMenu,
+    SquadScreen,
+    LoginReport,
     GameOver,
 }
 
@@ -30,6 +32,8 @@ impl GameFlow {
             Self::Playing => "Playing",
             Self::PauseMenu => "PauseMenu",
             Self::SkillMenu => "SkillMenu",
+            Self::SquadScreen => "SquadScreen",
+            Self::LoginReport => "LoginReport",
             Self::GameOver => "GameOver",
         }
     }
@@ -39,14 +43,13 @@ impl GameFlow {
         Self::Playing
     }
 
-    /// Esc while Playing opens PauseMenu; Esc while SkillMenu or PauseMenu returns to Playing
-    /// (unless a sub-menu screen is on the stack, handled before calling this).
-    /// Esc on MainMenu or GameOver never quits the app.
     #[inline]
     pub fn on_escape(self) -> Self {
         match self {
             Self::Playing => Self::PauseMenu,
-            Self::PauseMenu | Self::SkillMenu => Self::Playing,
+            Self::PauseMenu | Self::SkillMenu | Self::SquadScreen | Self::LoginReport => {
+                Self::Playing
+            }
             Self::MainMenu => Self::MainMenu,
             Self::GameOver => Self::GameOver,
         }
@@ -62,9 +65,18 @@ impl GameFlow {
     }
 
     #[inline]
+    pub fn on_toggle_squad_screen(self) -> Self {
+        match self {
+            Self::Playing => Self::SquadScreen,
+            Self::SquadScreen => Self::Playing,
+            other => other,
+        }
+    }
+
+    #[inline]
     pub fn on_focus_lost(self) -> Self {
         match self {
-            Self::Playing | Self::SkillMenu => Self::PauseMenu,
+            Self::Playing | Self::SkillMenu | Self::SquadScreen => Self::PauseMenu,
             other => other,
         }
     }
@@ -72,7 +84,7 @@ impl GameFlow {
     #[inline]
     pub fn on_player_death(self) -> Self {
         match self {
-            Self::Playing | Self::SkillMenu | Self::PauseMenu => Self::GameOver,
+            Self::Playing | Self::SkillMenu | Self::SquadScreen | Self::PauseMenu => Self::GameOver,
             other => other,
         }
     }
@@ -133,6 +145,18 @@ mod tests {
         assert_eq!(flow.on_escape(), GameFlow::GameOver);
         flow = flow.on_retry();
         assert_eq!(flow, GameFlow::Playing);
+
+        // Playing -> SquadScreen -> Playing, and LoginReport -> Playing
+        flow = flow.on_toggle_squad_screen();
+        assert_eq!(flow, GameFlow::SquadScreen);
+        assert!(flow.is_paused());
+        flow = flow.on_escape();
+        assert_eq!(flow, GameFlow::Playing);
+
+        flow = GameFlow::LoginReport;
+        assert!(flow.blocks_world_update());
+        assert_eq!(flow.on_escape(), GameFlow::Playing);
+
         flow = flow.on_back_to_main();
         assert_eq!(flow, GameFlow::MainMenu);
     }

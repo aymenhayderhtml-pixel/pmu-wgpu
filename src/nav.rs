@@ -89,6 +89,9 @@ impl NavGrid {
         for cz in 0..NAV_GRID_DIM {
             for cx in 0..NAV_GRID_DIM {
                 let center = Self::cell_to_world(cx, cz);
+                if crate::camp::overlaps_camp_zone(center.x, center.y, 0.0) {
+                    continue;
+                }
                 for aabb in aabbs {
                     if aabb.max.y > 0.05
                         && aabb.min.y < 2.0

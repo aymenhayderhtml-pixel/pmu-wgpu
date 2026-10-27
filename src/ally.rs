@@ -2,9 +2,12 @@ use crate::animation::{
     compute_hierarchy_and_joints, sample_clip_into, AnimationClip, PoseScratch, Skeleton,
 };
 use crate::camera::lerp_angle;
+use crate::camp::CampActivity;
 use crate::combat::HIT_FLASH_DURATION;
 use crate::enemy::DEATH_FALL_DURATION;
+use crate::life::AllyNeeds;
 use crate::player_anim::{AnimMode, ClipMap};
+use crate::traits::AllyProfile;
 use glam::{Mat4, Quat, Vec2, Vec3};
 
 pub const MAX_ALLIES: usize = 4;
@@ -134,6 +137,8 @@ pub enum AllyState {
     Attack,
     Recover,
     Regroup,
+    Flee,
+    Freeze,
     Down,
 }
 
@@ -145,6 +150,8 @@ impl AllyState {
             Self::Attack => "ATTACK",
             Self::Recover => "READY",
             Self::Regroup => "REGROUP",
+            Self::Flee => "FLEE",
+            Self::Freeze => "FREEZE",
             Self::Down => "DOWN",
         }
     }
@@ -154,6 +161,15 @@ pub struct Ally {
     pub id: u32,
     pub name: &'static str,
     pub rarity: Rarity,
+    pub profile: AllyProfile,
+    pub needs: AllyNeeds,
+    pub camp_activity: CampActivity,
+    pub activity_timer: f32,
+    pub decide_timer: f32,
+    pub activity_target_pos: Vec3,
+    pub spar_partner_id: Option<u32>,
+    pub pre_quarrel_hp: f32,
+    pub only_quarrel_damage: bool,
     pub prev_pos: Vec3,
     pub pos: Vec3,
     pub vel: Vec3,
@@ -180,7 +196,6 @@ pub struct Ally {
     pub path: Vec<Vec2>,
     pub path_index: usize,
     pub path_goal: Vec2,
-    // Animation state
     pub active_clip: usize,
     pub active_time: f32,
     pub prev_clip: Option<(usize, f32)>,
@@ -199,11 +214,35 @@ impl Ally {
         node_count: usize,
         initial_clip: usize,
     ) -> Self {
-        let max_hp = rarity.max_health();
+        let mut seed = 0x517C_C1B7_2722_0A95_u64 ^ (u64::from(id) * 0x9E37_79B9_7F4A_7C15);
+        Self::new_with_seed(id, name, rarity, spawn_pos, yaw, node_count, initial_clip, &mut seed)
+    }
+
+    pub fn new_with_seed(
+        id: u32,
+        name: &'static str,
+        rarity: Rarity,
+        spawn_pos: Vec3,
+        yaw: f32,
+        node_count: usize,
+        initial_clip: usize,
+        rng_state: &mut u64,
+    ) -> Self {
+        let profile = AllyProfile::roll(rng_state, rarity);
+        let max_hp = rarity.max_health() * profile.max_health_multiplier();
         Self {
             id,
             name,
             rarity,
+            profile,
+            needs: AllyNeeds::default(),
+            camp_activity: CampActivity::Idle,
+            activity_timer: 0.0,
+            decide_timer: 0.0,
+            activity_target_pos: spawn_pos,
+            spar_partner_id: None,
+            pre_quarrel_hp: max_hp,
+            only_quarrel_damage: true,
             prev_pos: spawn_pos,
             pos: spawn_pos,
             vel: Vec3::ZERO,
@@ -239,6 +278,23 @@ impl Ally {
         }
     }
 
+    pub fn refresh_stats_from_profile(&mut self) {
+        let new_max = self.rarity.max_health() * self.profile.max_health_multiplier();
+        if new_max > self.max_health {
+            self.health += new_max - self.max_health;
+        }
+        self.max_health = new_max;
+        self.health = self.health.min(self.max_health);
+    }
+
+    pub fn effective_damage(&self) -> f32 {
+        self.rarity.damage() * self.profile.damage_multiplier() * self.needs.damage_multiplier()
+    }
+
+    pub fn effective_speed_mult(&self) -> f32 {
+        self.rarity.speed_mult() * self.needs.speed_multiplier()
+    }
+
     pub fn is_living(&self) -> bool {
         self.state != AllyState::Down
     }
@@ -251,7 +307,10 @@ impl Ally {
         if self.is_down() || amount <= 0.0 {
             return false;
         }
-        self.health = (self.health - amount).max(0.0);
+        let mitigated = amount * self.profile.incoming_damage_multiplier();
+        self.profile.passives.record_damage_taken(mitigated);
+        self.only_quarrel_damage = false;
+        self.health = (self.health - mitigated).max(0.0);
         self.hit_flash_timer = HIT_FLASH_DURATION;
         if self.health <= 0.0 {
             self.state = AllyState::Down;
@@ -288,6 +347,9 @@ impl Ally {
         if self.is_down() {
             return [0.42, 0.44, 0.46, 1.0];
         }
+        if self.state == AllyState::Freeze || self.needs.freeze_timer > 0.0 {
+            return [0.45, 0.88, 1.0, 1.35];
+        }
         let base = self.rarity.tint();
         let hit_f = (self.hit_flash_timer / HIT_FLASH_DURATION).clamp(0.0, 1.0);
         let spawn_f = (self.spawn_fx_timer / ALLY_SPAWN_FX_DURATION).clamp(0.0, 1.0);
@@ -306,8 +368,10 @@ impl Ally {
         let spd = Vec2::new(self.vel.x, self.vel.z).length();
 
         let target_clip = match self.state {
-            AllyState::Down | AllyState::Recover => clip_map.idle,
-            AllyState::Attack | AllyState::Engage | AllyState::Regroup => clip_map.run,
+            AllyState::Down | AllyState::Recover | AllyState::Freeze => clip_map.idle,
+            AllyState::Attack | AllyState::Engage | AllyState::Regroup | AllyState::Flee => {
+                clip_map.run
+            }
             AllyState::Follow => {
                 if spd > 5.0 {
                     clip_map.run
@@ -328,9 +392,9 @@ impl Ally {
         }
 
         let rate = match self.state {
-            AllyState::Down => 0.0,
+            AllyState::Down | AllyState::Freeze => 0.0,
             AllyState::Attack => 1.60,
-            AllyState::Regroup => 1.35,
+            AllyState::Regroup | AllyState::Flee => 1.35,
             AllyState::Engage => 1.15,
             AllyState::Follow if spd > 0.3 => (spd / ALLY_WALK_SPEED).clamp(0.6, 1.6),
             _ => 1.0,

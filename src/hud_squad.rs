@@ -56,8 +56,24 @@ pub fn draw_squad_hud_elements(
                 };
 
                 text_scratch.clear();
-                let _ = write!(text_scratch, "{:<9} {:>7}", ally.name, ally.state.hud_label());
+                let _ = write!(
+                    text_scratch,
+                    "{:<7} L{:<2} {:>6}",
+                    ally.name,
+                    ally.profile.level,
+                    ally.state.hud_label()
+                );
                 push_text_line(out, text_scratch, px + 8.0, ry + 2.0, small_px, tint);
+
+                // Small colored hunger indicator dot next to each ally row
+                let h_col = if ally.needs.hunger > 90.0 {
+                    [1.0, 0.25, 0.20, 1.0]
+                } else if ally.needs.hunger > 70.0 {
+                    [1.0, 0.78, 0.22, 1.0]
+                } else {
+                    [0.35, 0.95, 0.45, 0.95]
+                };
+                push_solid_quad(out, px + panel_w - 14.0, ry + 4.0, 6.0, 6.0, h_col);
 
                 let bar_x = px + 8.0;
                 let bar_y = ry + 18.0;

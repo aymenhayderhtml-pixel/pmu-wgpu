@@ -4,6 +4,7 @@ use crate::animation::{AnimationClip, Skeleton};
 use crate::camera::{lerp_angle, Camera};
 use crate::collision::{Aabb, CollisionGrid};
 use crate::ally::ALLY_HEAL_PULSE_RADIUS;
+use crate::camp::overlaps_camp_zone;
 use crate::combat::{
     is_in_attack_arc, ActorId, CombatantInfo, Faction, FloatingKind, FloatingNumberPool,
     PlayerCombat, PLAYER_MAX_HEALTH, SWING_ARC_RAD, SWING_DAMAGE, SWING_RANGE, SWING_SPEED_MULT,
@@ -11,12 +12,13 @@ use crate::combat::{
 use crate::effects::EffectsPool;
 use crate::enemy::{Enemy, EnemyState};
 use crate::frustum::Frustum;
+use crate::game_flow::GameFlow;
 use crate::input::Input;
 use crate::nav::{NavGrid, NavSearchScratch};
-use crate::pickups::PickupManager;
+use crate::offline::{simulate_offline_progress, OfflineReport};
+use crate::pickups::{OrbCollectEvent, PickupManager, FOOD_ORB_TINT};
 use crate::player_anim::{AnimMode, ClipMap, PlayerAnimator};
 use crate::projectiles::{apply_skill_hit_to_enemy, ProjectileManager, SkillDamageHit};
-use crate::game_flow::GameFlow;
 use crate::save::{
     current_unix_seconds, SaveData, SavedAlly, SavedEnemy, WavePhase, SAVE_VERSION,
 };
@@ -26,8 +28,8 @@ use crate::skills::{
     compute_aim_direction_xz, level_multiplier, SkillId, SkillKind, CAST_SPEED_MULT,
 };
 use crate::squad::{AllySkillCast, AstarBudgetScheduler, Squad, SquadMode};
-use crate::waves::{WaveManager, MAX_ALIVE_ENEMIES};
-use glam::{Mat4, Quat, Vec2, Vec3};
+use crate::training::ALLY_TRAINING_DEATH_CHANCE;
+use crate::waves::{WaveManager, WaveTransition, MAX_ALIVE_ENEMIES};use glam::{Mat4, Quat, Vec2, Vec3};
 use std::fmt::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use winit::keyboard::KeyCode;
@@ -166,11 +168,11 @@ pub struct World {
     pub skill_inv: SkillInventory,
     pub menu: MenuState,
     pub game_flow: GameFlow,
+    pub login_report: Option<OfflineReport>,
     pub playtime_seconds: f64,
     pub total_kills: u32,
     pub autosave_requested: bool,
-    pub projectiles: ProjectileManager,
-    pub effects: EffectsPool,
+    pub projectiles: ProjectileManager,    pub effects: EffectsPool,
     pub pickups: PickupManager,
     pub floating_numbers: FloatingNumberPool,
     pub debug_draw_enabled: bool,
@@ -216,12 +218,11 @@ impl World {
             let (x, z) = loop {
                 let x = rng.range_f32(-half_bound, half_bound);
                 let z = rng.range_f32(-half_bound, half_bound);
-                if x * x + z * z > 6.25 {
+                if x * x + z * z > 6.25 && !overlaps_camp_zone(x, z, 1.2) {
                     break (x, z);
                 }
             };
-            let scale_xz = rng.range_f32(0.6, 1.6);
-            let scale_y = rng.range_f32(0.6, 2.4);
+            let scale_xz = rng.range_f32(0.6, 1.6);            let scale_y = rng.range_f32(0.6, 2.4);
             let scale = Vec3::new(scale_xz, scale_y, scale_xz);
             let _unused_yaw = rng.range_f32(0.0, std::f32::consts::TAU);
             let pos = Vec3::new(x, scale_y * 0.5, z);
@@ -246,11 +247,10 @@ impl World {
                 let (x, z) = loop {
                     let x = rng.range_f32(-half_bound, half_bound);
                     let z = rng.range_f32(-half_bound, half_bound);
-                    if x * x + z * z > 9.0 {
+                    if x * x + z * z > 9.0 && !overlaps_camp_zone(x, z, 1.2) {
                         break (x, z);
                     }
-                };
-                let uniform_scale = rng.range_f32(0.75, 1.35);
+                };                let uniform_scale = rng.range_f32(0.75, 1.35);
                 let yaw = rng.range_f32(0.0, std::f32::consts::TAU);
                 let model = Mat4::from_scale_rotation_translation(
                     Vec3::splat(uniform_scale),
@@ -289,10 +289,10 @@ impl World {
             skill_inv: SkillInventory::new(),
             menu: MenuState::new(),
             game_flow: GameFlow::MainMenu,
+            login_report: None,
             playtime_seconds: 0.0,
             total_kills: 0,
-            autosave_requested: false,
-            projectiles: ProjectileManager::new(),
+            autosave_requested: false,            projectiles: ProjectileManager::new(),
             effects: EffectsPool::new(),
             pickups: PickupManager::new(WORLD_SEED),
             floating_numbers: FloatingNumberPool::new(),
@@ -342,8 +342,8 @@ impl World {
         self.skill_inv.reset();
         self.menu.close(&mut self.game_flow);
         self.game_flow = GameFlow::Playing;
-        self.playtime_seconds = 0.0;
-        self.total_kills = 0;
+        self.login_report = None;
+        self.playtime_seconds = 0.0;        self.total_kills = 0;
         self.autosave_requested = false;
         self.projectiles.clear();
         self.effects.clear();
@@ -370,7 +370,9 @@ impl World {
     }
 
     pub fn to_save(&self) -> SaveData {
-        let wave_phase = if self.waves.pending_spawns == 0 && self.alive_enemy_count() == 0 {
+        let wave_phase = if self.waves.in_camp {
+            WavePhase::Camp
+        } else if self.waves.pending_spawns == 0 && self.alive_enemy_count() == 0 {
             WavePhase::Intermission
         } else {
             WavePhase::Active
@@ -387,6 +389,14 @@ impl World {
                 down: a.is_down(),
                 pos: a.pos,
                 hold_pos: a.hold_pos,
+                class: a.profile.class,
+                traits: a.profile.traits,
+                level: a.profile.level,
+                xp: a.profile.xp,
+                hunger: a.needs.hunger,
+                fear: a.needs.fear,
+                fatigue: a.needs.fatigue,
+                passives: a.profile.passives,
             });
         }
 
@@ -417,6 +427,7 @@ impl World {
             skill_counts: self.skill_inv.counts,
             skill_slots: self.skill_inv.slots,
             squad_mode: self.squad.mode,
+            food_stock: self.squad.food_stock,
             allies,
             enemies,
             wave_rng_state: self.waves.rng_state(),
@@ -438,6 +449,7 @@ impl World {
         self.floating_numbers.clear();
         self.menu.close(&mut self.game_flow);
         self.game_flow = GameFlow::Playing;
+        self.login_report = None;
         self.playtime_seconds = save.playtime_seconds;
         self.total_kills = save.total_kills;
         self.autosave_requested = false;
@@ -456,6 +468,7 @@ impl World {
 
         self.squad.reset(WORLD_SEED);
         self.squad.mode = save.squad_mode;
+        self.squad.food_stock = save.food_stock;
         self.squad.rng_state = save.squad_rng_state;
         let ally_nodes = self.ally_skeleton.as_ref().map_or(0, |s| s.nodes.len());
         let ally_clip = self.ally_clip_map.idle.unwrap_or(0);
@@ -471,6 +484,18 @@ impl World {
                 ally_nodes,
                 ally_clip,
             );
+            ally.profile = crate::traits::AllyProfile {
+                class: sa.class,
+                traits: sa.traits,
+                stars: crate::traits::stars_for_rarity(sa.rarity),
+                level: sa.level,
+                xp: sa.xp,
+                passives: sa.passives,
+            };
+            ally.needs.hunger = sa.hunger;
+            ally.needs.fear = sa.fear;
+            ally.needs.fatigue = sa.fatigue;
+            ally.refresh_stats_from_profile();
             ally.spawn_fx_timer = 0.0;
             ally.hold_pos = sa.hold_pos;
             if sa.down {
@@ -478,7 +503,7 @@ impl World {
                 ally.state = crate::ally::AllyState::Down;
                 ally.down_timer = 0.5;
             } else {
-                ally.health = sa.health;
+                ally.health = sa.health.min(ally.max_health);
             }
             self.squad.allies.push(ally);
         }
@@ -499,19 +524,46 @@ impl World {
             self.enemies.push(e);
         }
 
+        let in_camp = matches!(save.wave_phase, WavePhase::Camp | WavePhase::Intermission);
         self.waves.restore_state(
             save.wave_number,
-            match save.wave_phase {
-                WavePhase::Active => save.pending_spawns,
-                WavePhase::Intermission => 0,
-            },
+            if in_camp { 0 } else { save.pending_spawns },
             save.intermission_timer,
+            in_camp,
             save.score,
             save.wave_rng_state,
             (save.enemies.len() + 1) as u32,
         );
     }
 
+    /// Restores `raw_save` and computes offline progress against `now_unix` when loading from the Main Menu.
+    pub fn apply_save_with_offline(&mut self, raw_save: &SaveData, now_unix: u64) {
+        self.apply_save(raw_save);
+        let report = simulate_offline_progress(
+            &mut self.squad.allies,
+            &mut self.squad.food_stock,
+            &mut self.squad.rng_state,
+            raw_save.created_unix,
+            now_unix,
+            ALLY_TRAINING_DEATH_CHANCE,
+        );
+        if report.is_some() {
+            self.login_report = report;
+            self.game_flow = GameFlow::LoginReport;
+            self.autosave_requested = true;
+        }
+    }
+
+    pub fn skip_camp_phase(&mut self) -> bool {
+        if self.waves.skip_camp(self.squad.living_count()) {
+            self.squad.exit_camp_phase();
+            self.squad
+                .set_status_message_colored("Camp skipped -> Next wave!", [1.0, 0.90, 0.40]);
+            true
+        } else {
+            false
+        }
+    }
     pub fn summon_ally(&mut self) -> bool {
         let node_count = self.ally_skeleton.as_ref().map_or(0, |s| s.nodes.len());
         let init_clip = self.ally_clip_map.idle.unwrap_or(0);
@@ -662,9 +714,12 @@ impl World {
                 if killed {
                     self.total_kills += 1;
                     self.waves.add_kill_score();
-                    let _ = self.pickups.on_enemy_killed(e_pos, self.waves.current_wave);
-                }
-            }
+                    let _ = self.pickups.on_enemy_killed(
+                        e_pos,
+                        self.waves.current_wave,
+                        self.squad.food_stock,
+                    );
+                }            }
         }
     }
 
@@ -899,9 +954,12 @@ impl World {
                     if killed {
                         self.total_kills += 1;
                         self.waves.add_kill_score();
-                        let _ = self.pickups.on_enemy_killed(e_pos, self.waves.current_wave);
-                    }
-                }
+                        let _ = self.pickups.on_enemy_killed(
+                            e_pos,
+                            self.waves.current_wave,
+                            self.squad.food_stock,
+                        );
+                    }                }
             }
         }
 
@@ -916,7 +974,11 @@ impl World {
                 if killed {
                     self.total_kills += 1;
                     self.waves.add_kill_score();
-                    let _ = self.pickups.on_enemy_killed(e_pos, self.waves.current_wave);
+                    let _ = self.pickups.on_enemy_killed(
+                        e_pos,
+                        self.waves.current_wave,
+                        self.squad.food_stock,
+                    );
                 }
             }
         }
@@ -939,11 +1001,14 @@ impl World {
                     enemy.vel = Vec3::ZERO;
                     self.total_kills += 1;
                     self.waves.add_kill_score();
-                    let _ = self.pickups.on_enemy_killed(enemy.pos, self.waves.current_wave);
+                    let _ = self.pickups.on_enemy_killed(
+                        enemy.pos,
+                        self.waves.current_wave,
+                        self.squad.food_stock,
+                    );
                 }
             }
         }
-
         // Build shared CombatantInfo snapshot
         self.combatant_scratch.clear();
         self.combatant_scratch.push(CombatantInfo {
@@ -975,7 +1040,14 @@ impl World {
         // Shared round-robin A* budget (max 3 per step across allies and enemies)
         let mut ally_reqs = [false; MAX_ALLIES];
         let mut enemy_reqs = [false; MAX_ALIVE_ENEMIES];
-        self.squad.collect_astar_requests(self.player.pos, &self.enemies, &self.collision, &self.nav, &mut ally_reqs);
+        self.squad.collect_astar_requests(
+            self.waves.in_camp,
+            self.player.pos,
+            &self.enemies,
+            &self.collision,
+            &self.nav,
+            &mut ally_reqs,
+        );
         collect_enemy_astar_requests(&self.enemies, &self.combatant_scratch, &self.collision, &self.nav, &mut enemy_reqs);
 
         let mut combined_reqs = [false; MAX_ALLIES + MAX_ALIVE_ENEMIES];
@@ -993,23 +1065,39 @@ impl World {
 
         let holding_revive = !self.combat.is_dead() && input.is_pressed(KeyCode::KeyE);
         let player_hp_ratio = self.combat.health / PLAYER_MAX_HEALTH.max(1.0);
-        let squad_out = self.squad.update(
-            dt,
-            self.player.pos,
-            self.player.yaw,
-            player_hp_ratio,
-            holding_revive,
-            &self.enemies,
-            &self.combatant_scratch,
-            &ally_granted,
-            &self.collision,
-            &self.nav,
-            &mut self.nav_scratch,
-        );
+        let squad_out = if self.waves.in_camp {
+            self.squad.update_camp_phase(
+                dt,
+                self.player.pos,
+                holding_revive,
+                &self.combatant_scratch,
+                &ally_granted,
+                &self.collision,
+                &self.nav,
+                &mut self.nav_scratch,
+            )
+        } else {
+            self.squad.update(
+                dt,
+                self.player.pos,
+                self.player.yaw,
+                player_hp_ratio,
+                holding_revive,
+                &self.enemies,
+                &self.combatant_scratch,
+                &ally_granted,
+                &self.collision,
+                &self.nav,
+                &mut self.nav_scratch,
+            )
+        };
 
         if let Some((rev_pos, heal_amt)) = squad_out.revived_ally_pos_and_heal {
             self.floating_numbers.spawn_kind(rev_pos + Vec3::new(0.0, 2.2, 0.0), heal_amt, FloatingKind::Heal);
             self.effects.spawn_heal_particles(rev_pos);
+        }
+        if let Some(f_pos) = squad_out.fairy_flash_pos {
+            self.effects.spawn_ring(f_pos, 3.0, 0.50, [1.0, 0.70, 0.92]);
         }
 
         // Execute Rare/Epic ally skill casts (Fireball or Heal Pulse)
@@ -1036,7 +1124,11 @@ impl World {
                 if killed {
                     self.total_kills += 1;
                     self.waves.add_kill_score();
-                    let _ = self.pickups.on_enemy_killed(e_pos, self.waves.current_wave);
+                    let _ = self.pickups.on_enemy_killed(
+                        e_pos,
+                        self.waves.current_wave,
+                        self.squad.food_stock,
+                    );
                 }
             }
         }
@@ -1062,9 +1154,21 @@ impl World {
                     }
                 }
                 ActorId::Ally(ally_id) => {
+                    let mut downed_pos = None;
                     if let Some(ally) = self.squad.allies.iter_mut().find(|a| a.id == ally_id && a.is_living()) {
                         if ally.apply_damage(ev.damage) {
                             self.floating_numbers.spawn(ally.pos + Vec3::new(0.0, 2.1, 0.0), ev.damage.round() as u32, true);
+                            if ally.is_down() {
+                                downed_pos = Some(ally.pos);
+                            }
+                        }
+                    }
+                    // +25 fear spike once when another ally goes Down within 10 units
+                    if let Some(d_pos) = downed_pos {
+                        for other in &mut self.squad.allies {
+                            if other.is_living() && other.pos.distance(d_pos) <= 10.0 {
+                                other.needs.add_ally_down_fear_spike();
+                            }
                         }
                     }
                 }
@@ -1072,30 +1176,39 @@ impl World {
             }
         }
 
-        if let Some(outcome) = self.pickups.update(
+        if let Some(collect_ev) = self.pickups.update_with_food(
             dt,
             self.player.pos,
             !self.combat.is_dead(),
             &mut self.skill_inv,
+            &mut self.squad.food_stock,
         ) {
-            let mut msg = String::with_capacity(64);
-            let sk = match outcome {
-                PickupOutcome::Unlocked { skill, .. } => {
-                    let _ = write!(&mut msg, "Picked up: {}", skill.def().name);
-                    skill
+            match collect_ev {
+                OrbCollectEvent::FoodAdded(_) => {
+                    self.squad.set_status_message_colored("Food +1", FOOD_ORB_TINT);
+                    self.effects.spawn_pickup_sparkle(self.player.pos, FOOD_ORB_TINT);
                 }
-                PickupOutcome::LeveledUp { skill, new_level } => {
-                    let _ = write!(&mut msg, "{} level {}", skill.def().name, new_level);
-                    skill
+                OrbCollectEvent::Skill(outcome) => {
+                    let mut msg = String::with_capacity(64);
+                    let sk = match outcome {
+                        PickupOutcome::Unlocked { skill, .. } => {
+                            let _ = write!(&mut msg, "Picked up: {}", skill.def().name);
+                            skill
+                        }
+                        PickupOutcome::LeveledUp { skill, new_level } => {
+                            let _ = write!(&mut msg, "{} level {}", skill.def().name, new_level);
+                            skill
+                        }
+                        PickupOutcome::ExtraCopy { skill, count } => {
+                            let _ = write!(&mut msg, "Picked up: {} (x{})", skill.def().name, count);
+                            skill
+                        }
+                    };
+                    let tc = sk.def().tint;
+                    self.squad.set_status_message_colored(&msg, tc);
+                    self.effects.spawn_pickup_sparkle(self.player.pos, tc);
                 }
-                PickupOutcome::ExtraCopy { skill, count } => {
-                    let _ = write!(&mut msg, "Picked up: {} (x{})", skill.def().name, count);
-                    skill
-                }
-            };
-            let tc = sk.def().tint;
-            self.squad.set_status_message_colored(&msg, tc);
-            self.effects.spawn_pickup_sparkle(self.player.pos, tc);
+            }
         }
 
         self.effects.update(dt);
@@ -1104,7 +1217,7 @@ impl World {
         let total_allies_once_revived = self.squad.allies.len() as u32;
         let node_count = self.enemy_skeleton.as_ref().map_or(0, |s| s.nodes.len());
         let init_clip = self.enemy_clip_map.walk.unwrap_or(0);
-        let new_wave_started = self.waves.update(
+        let wave_trans = self.waves.update(
             dt,
             &mut self.enemies,
             self.player.pos,
@@ -1115,14 +1228,19 @@ impl World {
             init_clip,
         );
 
-        if new_wave_started {
-            self.autosave_requested = true;
-            for (r_pos, heal_amt) in self.squad.revive_all_down_for_new_wave() {
-                self.floating_numbers.spawn_kind(r_pos + Vec3::new(0.0, 2.2, 0.0), heal_amt, FloatingKind::Heal);
-                self.effects.spawn_heal_particles(r_pos);
+        match wave_trans {
+            WaveTransition::EnteredCamp => {
+                self.autosave_requested = true;
+                for (r_pos, heal_amt) in self.squad.enter_camp_phase() {
+                    self.floating_numbers.spawn_kind(r_pos + Vec3::new(0.0, 2.2, 0.0), heal_amt, FloatingKind::Heal);
+                    self.effects.spawn_heal_particles(r_pos);
+                }
             }
+            WaveTransition::StartedNextWave => {
+                self.squad.exit_camp_phase();
+            }
+            WaveTransition::None => {}
         }
-
         if self.combat.is_dead() {
             self.game_flow = self.game_flow.on_player_death();
         }
@@ -1181,6 +1299,12 @@ impl World {
             }
         }
 
+        self.squad.camp.append_visible_cube_instances(frustum, |inst| {
+            push_cube_instance_guarded(out, inst);
+        });
+        self.squad.fairy.append_visible_cube_instances(frustum, |inst| {
+            push_cube_instance_guarded(out, inst);
+        });
         self.projectiles.append_visible_cube_instances(frustum, out);
         self.pickups.append_visible_cube_instances(frustum, out);
         if out.len() > TOTAL_CUBE_INSTANCES {
@@ -1188,8 +1312,7 @@ impl World {
         }
         self.effects.append_visible_cube_instances(frustum, |inst| {
             push_cube_instance_guarded(out, inst);
-        });
-    }
+        });    }
 
     pub fn fill_visible_models(
         &self,
@@ -1323,10 +1446,10 @@ mod tests {
             skill_inv: SkillInventory::new(),
             menu: MenuState::new(),
             game_flow: GameFlow::Playing,
+            login_report: None,
             playtime_seconds: 0.0,
             total_kills: 0,
-            autosave_requested: false,
-            projectiles: ProjectileManager::new(),
+            autosave_requested: false,            projectiles: ProjectileManager::new(),
             effects: EffectsPool::new(),
             pickups: PickupManager::new(WORLD_SEED),
             floating_numbers: FloatingNumberPool::new(),
@@ -1704,5 +1827,70 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_camp_zone_cube_free_and_deterministic_3000_step_camp_simulation() {
+        let mut world = World::new(None, None, None, None, None, Vec::new(), None, Vec::new(), None, Vec::new());
+        world.new_game();
+
+        // 1. Verify no cube overlaps the reserved Camp zone (-20, 0, -20) half-size 6
+        for aabb in world.collision.aabbs() {
+            let cx = (aabb.min.x + aabb.max.x) * 0.5;
+            let cz = (aabb.min.z + aabb.max.z) * 0.5;
+            assert!(!overlaps_camp_zone(cx, cz, 0.5));
+        }
+        // NavGrid cells inside the camp are unblocked
+        let (camp_cx, camp_cz) = NavGrid::world_to_cell(Vec2::new(-20.0, -20.0));
+        assert!(!world.nav.is_blocked(camp_cx, camp_cz));
+
+        // 2. Start at a Camp phase with 4 allies near the camp
+        world.enemies.clear();
+        world.waves.pending_spawns = 0;
+        world.waves.score = 200;
+        for i in 0..4 {
+            assert!(world.summon_ally());
+            world.squad.allies[i].pos = crate::camp::CAMP_CENTER + Vec3::new((i as f32 - 1.5) * 1.2, 0.0, 0.0);
+            world.squad.allies[i].profile.traits = [
+                crate::traits::PersonalityTrait::Diligent,
+                crate::traits::PersonalityTrait::Calm,
+            ];
+        }
+
+        let mut input = Input::new();
+        let camera = Camera::new(world.player.pos, 16.0 / 9.0);
+        let dt = 1.0 / 60.0;
+
+        // First step enters Camp phase (45.0s = 2700 steps)
+        world.update(&mut input, &camera, dt);
+        assert!(world.waves.in_camp);
+        assert!(world.autosave_requested);
+
+        // Run 3000 fixed updates (50.0s): covers the full 45s camp phase and transitions to Wave 2!
+        for _ in 0..3000 {
+            world.update(&mut input, &camera, dt);
+            assert!(world.projectiles.active_projectile_count() as usize <= crate::projectiles::MAX_PROJECTILES);
+            assert!(world.effects.active_count() as usize <= crate::effects::MAX_EFFECT_ENTRIES);
+            assert!(world.pickups.active_orb_count() as usize <= crate::pickups::MAX_SKILL_ORBS);
+
+            for ally in &world.squad.allies {
+                assert!((0.0..=100.0).contains(&ally.needs.hunger));
+                for aabb in world.collision.aabbs() {
+                    assert!(!circle_overlaps_aabb_xz(ally.pos.x, ally.pos.z, ALLY_RADIUS - 0.02, aabb));
+                }
+            }
+            for enemy in &world.enemies {
+                for aabb in world.collision.aabbs() {
+                    assert!(!circle_overlaps_aabb_xz(enemy.pos.x, enemy.pos.z, ENEMY_RADIUS - 0.02, aabb));
+                }
+            }
+        }
+
+        assert!(
+            world.squad.training_sessions_completed >= 1,
+            "at least one training session must finish during the 45s camp phase"
+        );
+        assert!(!world.waves.in_camp, "camp timer must end within 3000 steps");
+        assert_eq!(world.waves.current_wave, 2, "Wave 2 must start after camp ends");
     }
 }

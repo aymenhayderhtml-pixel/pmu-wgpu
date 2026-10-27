@@ -165,7 +165,8 @@ impl DebugLinesRenderer {
                     AllyState::Engage => [0.30, 0.75, 1.0, 1.0],
                     AllyState::Attack => [1.0, 0.90, 0.20, 1.0],
                     AllyState::Recover => [0.75, 0.55, 1.0, 1.0],
-                    AllyState::Regroup => [1.0, 0.55, 0.15, 1.0],
+                    AllyState::Regroup | AllyState::Flee => [1.0, 0.55, 0.15, 1.0],
+                    AllyState::Freeze => [0.45, 0.90, 1.0, 1.0],
                     AllyState::Down => [0.55, 0.55, 0.55, 1.0],
                 };
                 let y = ally.pos.y + 0.18;

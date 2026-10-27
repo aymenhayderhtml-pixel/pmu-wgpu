@@ -2,6 +2,7 @@
 use crate::font::GLYPH_SIZE;
 use crate::game_flow::GameFlow;
 use crate::hud::{push_solid_quad, push_text_line, HudVertex};
+use crate::hud_life::{draw_login_report_panel, draw_squad_screen_panel};
 use crate::menu::{layout, ConfirmKind, MenuScreen, MenuSystem};
 use crate::save::SLOT_TITLES;
 use crate::stats::HudTelemetry;
@@ -45,6 +46,20 @@ pub fn draw_active_menu_and_fade(
     let flow = telemetry.game_flow;
     if matches!(flow, GameFlow::MainMenu | GameFlow::PauseMenu | GameFlow::GameOver) {
         draw_menu_screen(out, text_scratch, sw, sh, telemetry.hud_scale, telemetry.menu_sys, telemetry);
+    } else if flow == GameFlow::SquadScreen {
+        draw_squad_screen_panel(
+            out,
+            text_scratch,
+            sw,
+            sh,
+            telemetry.allies,
+            telemetry.selected_ally_idx,
+            telemetry.food_stock,
+        );
+    } else if flow == GameFlow::LoginReport {
+        if let Some(rep) = telemetry.login_report {
+            draw_login_report_panel(out, text_scratch, sw, sh, rep);
+        }
     }
 
     if telemetry.fade_alpha > 0.001 {

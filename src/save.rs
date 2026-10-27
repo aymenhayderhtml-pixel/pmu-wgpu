@@ -4,7 +4,12 @@ use crate::combat::PLAYER_MAX_HEALTH;
 use crate::enemy::{ENEMY_HEIGHT, ENEMY_MAX_HEALTH, ENEMY_RADIUS};
 use crate::skill_inv::{MAX_SKILL_COPIES, SLOT_COUNT};
 use crate::skills::{SkillId, PLAYER_MAX_MANA, SKILL_COUNT, SKILL_TABLE};
+use crate::life::START_FOOD_STOCK;
 use crate::squad::SquadMode;
+use crate::traits::{
+    AllyClass, AllyProfile, PassiveSkillSet, PersonalityTrait, MAX_ALLY_LEVEL,
+    MAX_PASSIVE_LEVEL, PASSIVE_SKILL_COUNT,
+};
 use crate::waves::MAX_ALIVE_ENEMIES;
 use crate::world::{GROUND_SIZE, PLAYER_HEIGHT, PLAYER_RADIUS};
 use glam::Vec3;
@@ -14,7 +19,7 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const SAVE_HEADER: &str = "PMU_SAVE";
-pub const SAVE_VERSION: u32 = 1;
+pub const SAVE_VERSION: u32 = 2;
 pub const SAVE_DIR_NAME: &str = "saves";
 
 pub const SLOT_FILES: [&str; 5] = [
@@ -37,6 +42,7 @@ pub const SLOT_TITLES: [&str; 5] = [
 pub enum WavePhase {
     Active,
     Intermission,
+    Camp,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -47,6 +53,14 @@ pub struct SavedAlly {
     pub down: bool,
     pub pos: Vec3,
     pub hold_pos: Vec3,
+    pub class: AllyClass,
+    pub traits: [PersonalityTrait; 2],
+    pub level: u8,
+    pub xp: u32,
+    pub hunger: f32,
+    pub fear: f32,
+    pub fatigue: f32,
+    pub passives: PassiveSkillSet,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -73,6 +87,7 @@ pub struct SaveData {
     pub skill_counts: [u8; SKILL_COUNT],
     pub skill_slots: [Option<SkillId>; SLOT_COUNT],
     pub squad_mode: SquadMode,
+    pub food_stock: u32,
     pub allies: Vec<SavedAlly>,
     pub enemies: Vec<SavedEnemy>,
     pub wave_rng_state: u64,
@@ -111,6 +126,7 @@ pub struct SlotInfo {
     pub score: u32,
     pub playtime_seconds: f64,
     pub ally_count: usize,
+    pub avg_ally_level: u8,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -196,6 +212,7 @@ impl SaveData {
         let phase_str = match self.wave_phase {
             WavePhase::Active => "Active",
             WavePhase::Intermission => "Intermission",
+            WavePhase::Camp => "Camp",
         };
         let _ = writeln!(&mut body, "progress.wave={}", self.wave_number);
         let _ = writeln!(&mut body, "progress.phase={}", phase_str);
@@ -217,6 +234,7 @@ impl SaveData {
             SquadMode::Aggressive => 2,
         };
         let _ = writeln!(&mut body, "squad.mode={}", mode_id);
+        let _ = writeln!(&mut body, "squad.food={}", self.food_stock);
         let _ = writeln!(&mut body, "ally.count={}", self.allies.len());
         for (i, a) in self.allies.iter().enumerate() {
             let r_id: u8 = match a.rarity {
@@ -234,6 +252,41 @@ impl SaveData {
             let _ = writeln!(&mut body, "ally.{}.hold_x={}", i, a.hold_pos.x);
             let _ = writeln!(&mut body, "ally.{}.hold_y={}", i, a.hold_pos.y);
             let _ = writeln!(&mut body, "ally.{}.hold_z={}", i, a.hold_pos.z);
+            let _ = writeln!(&mut body, "ally.{}.class={}", i, a.class as u8);
+            let _ = writeln!(&mut body, "ally.{}.trait0={}", i, a.traits[0] as u8);
+            let _ = writeln!(&mut body, "ally.{}.trait1={}", i, a.traits[1] as u8);
+            let _ = writeln!(&mut body, "ally.{}.level={}", i, a.level);
+            let _ = writeln!(&mut body, "ally.{}.xp={}", i, a.xp);
+            let _ = writeln!(&mut body, "ally.{}.hunger={}", i, a.hunger);
+            let _ = writeln!(&mut body, "ally.{}.fear={}", i, a.fear);
+            let _ = writeln!(&mut body, "ally.{}.fatigue={}", i, a.fatigue);
+            for p_idx in 0..PASSIVE_SKILL_COUNT {
+                let _ = writeln!(
+                    &mut body,
+                    "ally.{}.passive.{}.level={}",
+                    i, p_idx, a.passives.levels[p_idx]
+                );
+                let _ = writeln!(
+                    &mut body,
+                    "ally.{}.passive.{}.prog={}",
+                    i, p_idx, a.passives.progress[p_idx]
+                );
+            }
+            let _ = writeln!(
+                &mut body,
+                "ally.{}.pain.dmg={}",
+                i, a.passives.total_damage_taken
+            );
+            let _ = writeln!(
+                &mut body,
+                "ally.{}.pain.healed={}",
+                i, a.passives.total_rest_healed
+            );
+            let _ = writeln!(
+                &mut body,
+                "ally.{}.pain.points={}",
+                i, a.passives.pain_points
+            );
         }
 
         let _ = writeln!(&mut body, "enemy.count={}", self.enemies.len());
@@ -359,6 +412,7 @@ impl SaveData {
         let wave_phase = match find_val("progress.phase")? {
             "Active" => WavePhase::Active,
             "Intermission" => WavePhase::Intermission,
+            "Camp" => WavePhase::Camp,
             _ => return Err(SaveError::Invalid("progress.phase".to_string())),
         };
         let intermission_timer = parse_f32("progress.intermission_timer")?.max(0.0);
@@ -398,6 +452,12 @@ impl SaveData {
             _ => return Err(SaveError::Invalid("squad.mode".to_string())),
         };
 
+        let food_stock = if version >= 2 {
+            parse_u32("squad.food")?.min(20)
+        } else {
+            START_FOOD_STOCK
+        };
+
         let raw_ally_count = (parse_u32("ally.count")? as usize).min(MAX_ALLIES);
         let mut allies = Vec::with_capacity(raw_ally_count);
         for i in 0..raw_ally_count {
@@ -422,6 +482,42 @@ impl SaveData {
                 parse_f32(&format!("ally.{i}.hold_y"))?,
                 parse_f32(&format!("ally.{i}.hold_z"))?,
             );
+
+            let (class, traits, level, xp, hunger, fear, fatigue, passives) = if version >= 2 {
+                let cl = AllyClass::from_u8(parse_u32(&format!("ally.{i}.class"))? as u8);
+                let t0 = PersonalityTrait::from_u8(parse_u32(&format!("ally.{i}.trait0"))? as u8);
+                let t1 = PersonalityTrait::from_u8(parse_u32(&format!("ally.{i}.trait1"))? as u8);
+                let lv = (parse_u32(&format!("ally.{i}.level"))? as u8).clamp(1, MAX_ALLY_LEVEL);
+                let xp_v = parse_u32(&format!("ally.{i}.xp"))?;
+                let hng = parse_f32(&format!("ally.{i}.hunger"))?.clamp(0.0, 100.0);
+                let fr = parse_f32(&format!("ally.{i}.fear"))?.clamp(0.0, 100.0);
+                let fat = parse_f32(&format!("ally.{i}.fatigue"))?.clamp(0.0, 100.0);
+                let mut p_set = PassiveSkillSet::default();
+                for p_idx in 0..PASSIVE_SKILL_COUNT {
+                    p_set.levels[p_idx] = (parse_u32(&format!("ally.{i}.passive.{p_idx}.level"))?
+                        as u8)
+                        .min(MAX_PASSIVE_LEVEL);
+                    p_set.progress[p_idx] =
+                        (parse_u32(&format!("ally.{i}.passive.{p_idx}.prog"))? as u8).min(2);
+                }
+                p_set.total_damage_taken = parse_f32(&format!("ally.{i}.pain.dmg"))?.max(0.0);
+                p_set.total_rest_healed = parse_f32(&format!("ally.{i}.pain.healed"))?.max(0.0);
+                p_set.pain_points = parse_u32(&format!("ally.{i}.pain.points"))?;
+                (cl, [t0, t1], lv, xp_v, hng, fr, fat, p_set)
+            } else {
+                let def_p = AllyProfile::from_deterministic_v1(rarity, name_index);
+                (
+                    def_p.class,
+                    def_p.traits,
+                    1,
+                    0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    PassiveSkillSet::default(),
+                )
+            };
+
             allies.push(SavedAlly {
                 rarity,
                 name_index,
@@ -429,6 +525,14 @@ impl SaveData {
                 down,
                 pos,
                 hold_pos,
+                class,
+                traits,
+                level,
+                xp,
+                hunger,
+                fear,
+                fatigue,
+                passives,
             });
         }
 
@@ -466,6 +570,7 @@ impl SaveData {
             skill_counts,
             skill_slots,
             squad_mode,
+            food_stock,
             allies,
             enemies,
             wave_rng_state,
@@ -487,10 +592,23 @@ impl SaveData {
             collision,
         );
 
+        self.food_stock = self.food_stock.min(20);
         self.allies.truncate(MAX_ALLIES);
         for ally in &mut self.allies {
             ally.name_index = ally.name_index.min(5);
-            let max_hp = ally.rarity.max_health();
+            ally.level = ally.level.clamp(1, MAX_ALLY_LEVEL);
+            ally.hunger = ally.hunger.clamp(0.0, 100.0);
+            ally.fear = ally.fear.clamp(0.0, 100.0);
+            ally.fatigue = ally.fatigue.clamp(0.0, 100.0);
+            let prof = AllyProfile {
+                class: ally.class,
+                traits: ally.traits,
+                stars: crate::traits::stars_for_rarity(ally.rarity),
+                level: ally.level,
+                xp: ally.xp,
+                passives: ally.passives,
+            };
+            let max_hp = ally.rarity.max_health() * prof.max_health_multiplier();
             if ally.down {
                 ally.health = 0.0;
             } else {
@@ -508,12 +626,19 @@ impl SaveData {
     }
 
     pub fn slot_info(&self) -> SlotInfo {
+        let avg_ally_level = if self.allies.is_empty() {
+            0
+        } else {
+            let sum: u32 = self.allies.iter().map(|a| u32::from(a.level)).sum();
+            ((sum as f32) / (self.allies.len() as f32)).round() as u8
+        };
         SlotInfo {
             created_unix: self.created_unix,
             wave: self.wave_number,
             score: self.score,
             playtime_seconds: self.playtime_seconds,
             ally_count: self.allies.len(),
+            avg_ally_level,
         }
     }
 }
@@ -703,6 +828,7 @@ mod tests {
                 None,
             ],
             squad_mode: SquadMode::Aggressive,
+            food_stock: 11,
             allies: vec![
                 SavedAlly {
                     rarity: Rarity::Rare,
@@ -711,6 +837,14 @@ mod tests {
                     down: false,
                     pos: Vec3::new(3.0, 0.0, -2.0),
                     hold_pos: Vec3::new(3.0, 0.0, -2.0),
+                    class: AllyClass::Archer,
+                    traits: [PersonalityTrait::Diligent, PersonalityTrait::LightEater],
+                    level: 3,
+                    xp: 120,
+                    hunger: 35.0,
+                    fear: 10.0,
+                    fatigue: 25.0,
+                    passives: PassiveSkillSet::default(),
                 },
                 SavedAlly {
                     rarity: Rarity::Common,
@@ -719,6 +853,14 @@ mod tests {
                     down: true,
                     pos: Vec3::new(-2.0, 0.0, 1.0),
                     hold_pos: Vec3::new(-2.0, 0.0, 1.0),
+                    class: AllyClass::Fighter,
+                    traits: [PersonalityTrait::Brave, PersonalityTrait::HungryType],
+                    level: 2,
+                    xp: 40,
+                    hunger: 50.0,
+                    fear: 0.0,
+                    fatigue: 0.0,
+                    passives: PassiveSkillSet::default(),
                 },
             ],
             enemies: vec![SavedEnemy {
@@ -753,13 +895,38 @@ mod tests {
         let parsed_ext = SaveData::from_text(&extended).expect("unknown keys should be ignored");
         assert_eq!(orig, parsed_ext);
 
-        // Future version rejected
-        tampered = text.replace("version=1", "version=2");
+        // Future version (v3) rejected
+        tampered = text.replace("version=2", "version=3");
         let lines2: Vec<&str> = tampered.lines().collect();
         let body2 = format!("{}\n", lines2[..lines2.len() - 1].join("\n"));
         let h2 = fnv1a_64(body2.as_bytes());
-        let v2_txt = format!("{body2}checksum={h2:016x}\n");
-        assert_eq!(SaveData::from_text(&v2_txt), Err(SaveError::BadVersion(2)));
+        let v3_txt = format!("{body2}checksum={h2:016x}\n");
+        assert_eq!(SaveData::from_text(&v3_txt), Err(SaveError::BadVersion(3)));
+
+        // Version 1 save loads cleanly with deterministic defaults (level 1, hunger 0, food 6)
+        let v1_raw = text.replace("version=2", "version=1");
+        let v1_lines: Vec<&str> = v1_raw
+            .lines()
+            .filter(|l| {
+                !l.starts_with("squad.food=")
+                    && !l.contains(".class=")
+                    && !l.contains(".trait")
+                    && !l.contains(".level=")
+                    && !l.contains(".xp=")
+                    && !l.contains(".hunger=")
+                    && !l.contains(".fear=")
+                    && !l.contains(".fatigue=")
+                    && !l.contains(".passive.")
+                    && !l.contains(".pain.")
+            })
+            .collect();
+        let v1_body = format!("{}\n", v1_lines[..v1_lines.len() - 1].join("\n"));
+        let v1_hash = fnv1a_64(v1_body.as_bytes());
+        let v1_full = format!("{v1_body}checksum={v1_hash:016x}\n");
+        let parsed_v1 = SaveData::from_text(&v1_full).expect("v1 save must load");
+        assert_eq!(parsed_v1.food_stock, START_FOOD_STOCK);
+        assert_eq!(parsed_v1.allies[0].level, 1);
+        assert_eq!(parsed_v1.allies[0].hunger, 0.0);
     }
 
     #[test]
