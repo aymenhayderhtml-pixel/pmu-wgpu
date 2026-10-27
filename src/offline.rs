@@ -14,6 +14,7 @@ pub const OFFLINE_HUNGER_PER_TICK: f32 = 20.0;
 
 #[derive(Clone, Debug)]
 pub struct AllyOfflineRow {
+    #[cfg(test)]
     pub ally_id: u32,
     pub name: &'static str,
     pub class: AllyClass,
@@ -75,6 +76,7 @@ pub fn simulate_offline_progress(
     let mut rows: Vec<AllyOfflineRow> = allies
         .iter()
         .map(|a| AllyOfflineRow {
+            #[cfg(test)]
             ally_id: a.id,
             name: a.name,
             class: a.profile.class,
@@ -272,6 +274,7 @@ mod tests {
             0.0,
         )
         .expect("3h should produce report");
+        assert_eq!(rep_3h.rows[0].ally_id, 1);
         assert_eq!(rep_3h.ticks, 18);
         assert!(rep_3h.food_consumed > 0);
         assert!(rep_3h.rows[0].sessions_trained > 0);

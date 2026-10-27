@@ -36,6 +36,7 @@ impl AllyClass {
         }
     }
 
+    #[cfg(test)]
     pub fn label(self) -> &'static str {
         match self {
             Self::Fighter => "Fighter",
@@ -336,6 +337,7 @@ mod tests {
     fn test_level_xp_progression_and_stat_multipliers() {
         let mut seed = 42u64;
         let mut prof = AllyProfile::roll(&mut seed, Rarity::Common);
+        assert_eq!(prof.class.label(), "Archer");
         assert_eq!(prof.stars, 1);
         assert_eq!(prof.level, 1);
         assert_eq!(prof.xp_needed_for_next_level(), 100);

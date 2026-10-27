@@ -1,41 +1,49 @@
-
-use crate::font::GLYPH_SIZE;
 use crate::game_flow::GameFlow;
 use crate::hud::{push_solid_quad, push_text_line, HudVertex};
 use crate::hud_life::{draw_login_report_panel, draw_squad_screen_panel};
+use crate::hud_squad::draw_skill_menu_panel;
 use crate::menu::{layout, ConfirmKind, MenuScreen, MenuSystem};
 use crate::save::SLOT_TITLES;
 use crate::stats::HudTelemetry;
+use crate::ui_text::{
+    compute_controls_layout, fit_scale, text_height, text_width, truncate_to_width, BASE_GLYPH_PX,
+};
 use std::fmt::Write;
 
-const CONTROLS_LEFT: [&str; 11] = [
-    "WASD           : Move Player",
-    "Mouse / Arrows : Orbit Camera",
-    "Left Click     : Melee Attack / Menu Click",
-    "Space          : Jump (Coyote + Buffer)",
-    "Left Shift     : Sprint (8.5 m/s)",
-    "C              : Dodge Roll (i-frames)",
-    "Q / F / X / V  : Cast Skill Slots 1..4",
-    "T              : Quick-Fuse Tier 1 Skills",
-    "K              : Open/Close Skill Grimoire",
-    "G              : Summon Ally (30 Score)",
-    "E (Hold 2.0s)  : Revive Downed Ally",
+pub const CONTROLS_LEFT: [&str; 13] = [
+    "WASD            : Move Player",
+    "Mouse / Arrows  : Orbit Camera",
+    "Left Click      : Melee Attack / Menu Click",
+    "Space           : Jump (Coyote + Buffer)",
+    "Left Shift      : Sprint (8.5 m/s)",
+    "C               : Dodge Roll (i-frames)",
+    "Q / F / X / V   : Cast Skill Slots 1..4",
+    "T               : Quick-Fuse Tier 1 Skills",
+    "K               : Open/Close Skill Menu",
+    "H               : Open/Close Squad Screen",
+    "N               : Skip 45s Camp Phase",
+    "G               : Summon Ally (30 Score)",
+    "E (Hold 2.0s)   : Revive Downed Ally",
 ];
 
-const CONTROLS_RIGHT: [&str; 11] = [
-    "1 / 2 / 3      : Squad Mode (Follow/Hold/Aggr)",
-    "R              : Restart Game",
-    "F1             : Toggle PresentMode (VSync/Fast)",
-    "F2             : Cycle Render Scale",
-    "F3             : Toggle Top-Left Debug Panel",
-    "F4             : Cycle Shadow Quality",
-    "F5 / F6        : Cycle Model Yaw / Anim Clip",
-    "F7 / F8        : Debug AABBs & Bones / AI Cones",
-    "F9 / F10       : Quicksave / Quickload",
-    "Delete (Menu)  : Delete Selected Save Slot",
-    "Escape         : Pause / Back in Menus",
+pub const CONTROLS_RIGHT: [&str; 13] = [
+    "1 / 2 / 3 (Game): Squad Mode (Fol/Hld/Aggr)",
+    "R               : Restart Game",
+    "Up/Down (Menu)  : Select Row / Skill / Ally",
+    "Left/Right/Tab  : Adjust Setting / Section",
+    "Enter           : Activate / Fuse Recipe",
+    "1..4 / Backspace: Equip Slot / Clear Slot",
+    "Delete (Saves)  : Delete Selected Save",
+    "F1 / F2         : Present Mode / Render Scale",
+    "F3 / F4         : Debug Panel / Shadow Qual",
+    "F5 / F6         : Model Yaw / Anim Clip",
+    "F7 / F8         : Debug AABBs / AI Cones",
+    "F9 / F10        : Quicksave / Quickload",
+    "Escape          : Pause / Back / Close Menu",
 ];
 
+/// Draws any active modal menu LAST over the entire screen (including its own dark backdrop),
+/// followed by the screen-transition fade overlay.
 pub fn draw_active_menu_and_fade(
     out: &mut Vec<HudVertex>,
     text_scratch: &mut String,
@@ -44,22 +52,39 @@ pub fn draw_active_menu_and_fade(
     telemetry: &HudTelemetry<'_>,
 ) {
     let flow = telemetry.game_flow;
-    if matches!(flow, GameFlow::MainMenu | GameFlow::PauseMenu | GameFlow::GameOver) {
-        draw_menu_screen(out, text_scratch, sw, sh, telemetry.hud_scale, telemetry.menu_sys, telemetry);
-    } else if flow == GameFlow::SquadScreen {
-        draw_squad_screen_panel(
-            out,
-            text_scratch,
-            sw,
-            sh,
-            telemetry.allies,
-            telemetry.selected_ally_idx,
-            telemetry.food_stock,
-        );
-    } else if flow == GameFlow::LoginReport {
-        if let Some(rep) = telemetry.login_report {
-            draw_login_report_panel(out, text_scratch, sw, sh, rep);
+    match flow {
+        GameFlow::MainMenu | GameFlow::PauseMenu | GameFlow::GameOver => {
+            draw_menu_screen(
+                out,
+                text_scratch,
+                sw,
+                sh,
+                telemetry.hud_scale,
+                telemetry.menu_sys,
+                telemetry,
+            );
         }
+        GameFlow::SkillMenu => {
+            draw_skill_menu_panel(out, text_scratch, sw, sh, telemetry);
+        }
+        GameFlow::SquadScreen => {
+            draw_squad_screen_panel(
+                out,
+                text_scratch,
+                sw,
+                sh,
+                telemetry.hud_scale,
+                telemetry.allies,
+                telemetry.selected_ally_idx,
+                telemetry.food_stock,
+            );
+        }
+        GameFlow::LoginReport => {
+            if let Some(rep) = telemetry.login_report {
+                draw_login_report_panel(out, text_scratch, sw, sh, telemetry.hud_scale, rep);
+            }
+        }
+        GameFlow::Playing => {}
     }
 
     if telemetry.fade_alpha > 0.001 {
@@ -77,60 +102,95 @@ fn draw_menu_screen(
     menu: &MenuSystem,
     telemetry: &HudTelemetry<'_>,
 ) {
-    // Dark semi-transparent backdrop over the frozen/orbiting 3D scene
-    push_solid_quad(out, 0.0, 0.0, sw, sh, [0.01, 0.02, 0.04, 0.62]);
+    push_solid_quad(out, 0.0, 0.0, sw, sh, [0.01, 0.02, 0.04, 0.64]);
 
     let scr = menu.current_screen();
-    let hs = (hud_scale_u.clamp(1, 3)) as f32;
-
     if scr == MenuScreen::Controls {
-        draw_controls_screen(out, sw, sh, hs, hud_scale_u, menu);
+        draw_controls_screen(out, sw, sh, hud_scale_u, menu);
         return;
     }
 
     let lay = layout(sw as u32, sh as u32, hud_scale_u, menu.item_count);
     let p = lay.panel;
 
-    push_solid_quad(out, p.x - 3.0, p.y - 3.0, p.w + 6.0, p.h + 6.0, [0.42, 0.62, 0.88, 0.92]);
-    push_solid_quad(out, p.x, p.y, p.w, p.h, [0.03, 0.05, 0.09, 0.94]);
+    push_solid_quad(
+        out,
+        p.x - 3.0,
+        p.y - 3.0,
+        p.w + 6.0,
+        p.h + 6.0,
+        [0.42, 0.62, 0.88, 0.92],
+    );
+    push_solid_quad(out, p.x, p.y, p.w, p.h, [0.03, 0.05, 0.09, 0.95]);
 
-    let base_glyph = GLYPH_SIZE as f32;
+    let inner_w = (p.w - 32.0).max(80.0);
+    let title_band_h = (lay.subtitle_y - lay.title_y).max(10.0);
+    let row0_top = if lay.row_count > 0 {
+        lay.rows[0].y
+    } else {
+        p.y + p.h
+    };
+    let sub_band_h = (row0_top - lay.subtitle_y - 4.0).max(8.0);
+
     match scr {
         MenuScreen::Main => {
-            let title_px = base_glyph * (hs + 2.0).min(4.5);
             let title = "PICK ME UP";
-            let tw = (title.len() as f32) * title_px;
+            let t_sc = fit_scale(
+                hud_scale_u + 1,
+                (title.len() as f32) * BASE_GLYPH_PX,
+                BASE_GLYPH_PX,
+                inner_w,
+                title_band_h,
+            );
+            let t_th = text_height(t_sc);
+            let t_str = truncate_to_width(title, t_sc, inner_w);
+            let tw = text_width(&t_str, t_sc);
             push_text_line(
                 out,
-                title,
+                &t_str,
                 p.x + (p.w - tw) * 0.5,
                 lay.title_y,
-                title_px,
+                t_th,
                 [1.0, 0.90, 0.35, 1.0],
             );
 
-            let sub_px = base_glyph * (hs * 0.75).max(1.2);
             let sub = "wgpu edition";
-            let sub_w = (sub.len() as f32) * sub_px;
+            let s_sc = fit_scale(
+                hud_scale_u,
+                (sub.len() as f32) * BASE_GLYPH_PX,
+                BASE_GLYPH_PX,
+                inner_w,
+                sub_band_h,
+            );
+            let s_th = text_height(s_sc);
+            let s_str = truncate_to_width(sub, s_sc, inner_w);
+            let sw_px = text_width(&s_str, s_sc);
             push_text_line(
                 out,
-                sub,
-                p.x + (p.w - sub_w) * 0.5,
-                lay.subtitle_y + 4.0,
-                sub_px,
+                &s_str,
+                p.x + (p.w - sw_px) * 0.5,
+                lay.subtitle_y,
+                s_th,
                 [0.65, 0.88, 1.0, 1.0],
             );
         }
         MenuScreen::GameOver => {
-            let title_px = base_glyph * (hs + 1.5).min(4.0);
             let title = "YOU DIED";
-            let tw = (title.len() as f32) * title_px;
+            let t_sc = fit_scale(
+                hud_scale_u + 1,
+                (title.len() as f32) * BASE_GLYPH_PX,
+                BASE_GLYPH_PX,
+                inner_w,
+                title_band_h,
+            );
+            let t_th = text_height(t_sc);
+            let tw = text_width(title, t_sc);
             push_text_line(
                 out,
                 title,
                 p.x + (p.w - tw) * 0.5,
                 lay.title_y,
-                title_px,
+                t_th,
                 [1.0, 0.25, 0.22, 1.0],
             );
 
@@ -140,19 +200,26 @@ fn draw_menu_screen(
                 "Wave: {}   Score: {}   Kills: {}",
                 telemetry.wave_number, telemetry.score, telemetry.total_kills
             );
-            let sub_px = (base_glyph * hs * 0.75).max(10.0);
-            let sub_w = (text_scratch.len() as f32) * sub_px;
+            let s_sc = fit_scale(
+                hud_scale_u,
+                (text_scratch.len() as f32) * BASE_GLYPH_PX,
+                BASE_GLYPH_PX,
+                inner_w,
+                sub_band_h,
+            );
+            let s_th = text_height(s_sc);
+            let s_str = truncate_to_width(text_scratch, s_sc, inner_w);
+            let sw_px = text_width(&s_str, s_sc);
             push_text_line(
                 out,
-                text_scratch,
-                p.x + (p.w - sub_w) * 0.5,
-                lay.subtitle_y + 2.0,
-                sub_px,
+                &s_str,
+                p.x + (p.w - sw_px) * 0.5,
+                lay.subtitle_y,
+                s_th,
                 [0.92, 0.94, 0.98, 1.0],
             );
         }
         MenuScreen::Confirm(kind) => {
-            let title_px = (base_glyph * (hs + 0.5)).min(24.0);
             text_scratch.clear();
             match kind {
                 ConfirmKind::OverwriteSave(slot) => {
@@ -164,32 +231,49 @@ fn draw_menu_screen(
                     let _ = write!(text_scratch, "Delete {}?", name);
                 }
             }
-            let tw = (text_scratch.len() as f32) * title_px;
+            let h_sc = fit_scale(
+                hud_scale_u,
+                (text_scratch.len() as f32) * BASE_GLYPH_PX,
+                BASE_GLYPH_PX,
+                inner_w,
+                title_band_h + sub_band_h,
+            );
+            let h_th = text_height(h_sc);
+            let h_str = truncate_to_width(text_scratch, h_sc, inner_w);
+            let tw = text_width(&h_str, h_sc);
             push_text_line(
                 out,
-                text_scratch,
+                &h_str,
                 p.x + (p.w - tw) * 0.5,
-                lay.title_y + 8.0,
-                title_px,
+                lay.title_y + 4.0,
+                h_th,
                 [1.0, 0.85, 0.35, 1.0],
             );
         }
         _ => {
             let header = match scr {
                 MenuScreen::Pause => "PAUSED",
-                MenuScreen::SaveSlots => "SAVE GAME (Enter:Save  Del:Delete  Esc:Back)",
-                MenuScreen::LoadSlots => "LOAD GAME (Enter:Load  Del:Delete  Esc:Back)",
-                MenuScreen::Settings => "SETTINGS (Left/Right:Adjust  Esc:Back)",
+                MenuScreen::SaveSlots => "SAVE GAME (Enter:Save Del:Delete Esc:Back)",
+                MenuScreen::LoadSlots => "LOAD GAME (Enter:Load Del:Delete Esc:Back)",
+                MenuScreen::Settings => "SETTINGS (Left/Right:Adjust Esc:Back)",
                 _ => "MENU",
             };
-            let title_px = (base_glyph * (hs * 0.95)).clamp(11.0, 22.0);
-            let tw = (header.len() as f32) * title_px;
+            let h_sc = fit_scale(
+                hud_scale_u,
+                (header.len() as f32) * BASE_GLYPH_PX,
+                BASE_GLYPH_PX,
+                inner_w,
+                title_band_h + sub_band_h,
+            );
+            let h_th = text_height(h_sc);
+            let h_str = truncate_to_width(header, h_sc, inner_w);
+            let tw = text_width(&h_str, h_sc);
             push_text_line(
                 out,
-                header,
-                p.x + (p.w - tw).max(12.0) * 0.5,
-                lay.title_y + 6.0,
-                title_px,
+                &h_str,
+                p.x + (p.w - tw) * 0.5,
+                lay.title_y + 4.0,
+                h_th,
                 [1.0, 0.92, 0.45, 1.0],
             );
         }
@@ -224,10 +308,18 @@ fn draw_menu_screen(
             [0.90, 0.94, 1.0, 1.0]
         };
 
-        let max_glyph_by_w = ((r.w - 16.0) / (item.label.len().max(1) as f32)).floor();
-        let glyph_px = (r.h * 0.48).min(max_glyph_by_w).clamp(8.0, 18.0);
-        let ty = r.y + (r.h - glyph_px) * 0.5;
-        push_text_line(out, &item.label, r.x + 10.0, ty, glyph_px, text_col);
+        let row_inner_w = (r.w - 20.0).max(40.0);
+        let row_sc = fit_scale(
+            hud_scale_u,
+            (item.label.len() as f32) * BASE_GLYPH_PX,
+            BASE_GLYPH_PX,
+            row_inner_w,
+            (r.h - 4.0).max(8.0),
+        );
+        let r_th = text_height(row_sc);
+        let r_str = truncate_to_width(&item.label, row_sc, row_inner_w);
+        let ty = r.y + (r.h - r_th) * 0.5;
+        push_text_line(out, &r_str, r.x + 10.0, ty, r_th, text_col);
     }
 }
 
@@ -235,45 +327,60 @@ fn draw_controls_screen(
     out: &mut Vec<HudVertex>,
     sw: f32,
     sh: f32,
-    hs: f32,
     hud_scale_u: u32,
     menu: &MenuSystem,
 ) {
-    let pw = (760.0 + hs * 40.0).min((sw - 24.0).max(320.0));
-    let ph = (390.0 + hs * 24.0).min((sh - 24.0).max(260.0));
-    let px = ((sw - pw) * 0.5).max(12.0);
-    let py = ((sh - ph) * 0.5).max(12.0);
+    let c_lay = compute_controls_layout(hud_scale_u, sw, sh, &CONTROLS_LEFT, &CONTROLS_RIGHT);
+    let sc = c_lay.scale;
+    let th = text_height(sc);
+    let p = c_lay.panel;
 
-    push_solid_quad(out, px - 3.0, py - 3.0, pw + 6.0, ph + 6.0, [0.42, 0.62, 0.88, 0.92]);
-    push_solid_quad(out, px, py, pw, ph, [0.03, 0.05, 0.09, 0.94]);
+    push_solid_quad(
+        out,
+        p.x - 3.0,
+        p.y - 3.0,
+        p.w + 6.0,
+        p.h + 6.0,
+        [0.42, 0.62, 0.88, 0.92],
+    );
+    push_solid_quad(out, p.x, p.y, p.w, p.h, [0.03, 0.05, 0.09, 0.95]);
 
+    let hdr = truncate_to_width("CONTROLS & HOTKEYS", sc, p.w - c_lay.pad * 2.0);
     push_text_line(
         out,
-        "CONTROLS & HOTKEYS",
-        px + 18.0,
-        py + 14.0,
-        14.0,
+        &hdr,
+        c_lay.left_x,
+        c_lay.title_y,
+        th,
         [1.0, 0.92, 0.45, 1.0],
     );
 
-    let col_w = (pw - 40.0) * 0.5;
-    let left_x = px + 18.0;
-    let right_x = px + 22.0 + col_w;
-    let mut row_y = py + 44.0;
-    let step_y = ((ph - 110.0) / 11.0).clamp(16.0, 26.0);
-    let font_px = (col_w / 46.0).clamp(8.0, 11.0);
-
-    for i in 0..11 {
-        push_text_line(out, CONTROLS_LEFT[i], left_x, row_y, font_px, [0.88, 0.94, 1.0, 1.0]);
-        push_text_line(out, CONTROLS_RIGHT[i], right_x, row_y, font_px, [0.88, 0.94, 1.0, 1.0]);
-        row_y += step_y;
+    for i in 0..CONTROLS_LEFT.len() {
+        let ry = c_lay.rows_start_y + (i as f32) * c_lay.row_step;
+        let l_str = truncate_to_width(CONTROLS_LEFT[i], sc, c_lay.left_w);
+        let r_str = truncate_to_width(CONTROLS_RIGHT[i], sc, c_lay.right_w);
+        push_text_line(out, &l_str, c_lay.left_x, ry, th, [0.88, 0.94, 1.0, 1.0]);
+        push_text_line(out, &r_str, c_lay.right_x, ry, th, [0.88, 0.94, 1.0, 1.0]);
     }
 
-    let lay = layout(sw as u32, sh as u32, hud_scale_u, 1);
-    let r = lay.rows[0];
-    let back_y = py + ph - r.h - 14.0;
-    push_solid_quad(out, r.x - 1.5, back_y - 1.5, r.w + 3.0, r.h + 3.0, [0.45, 0.90, 1.0, 0.98]);
-    push_solid_quad(out, r.x, back_y, r.w, r.h, [0.18, 0.30, 0.48, 0.95]);
-    let label = &menu.items[0].label;
-    push_text_line(out, label, r.x + 12.0, back_y + (r.h - 12.0) * 0.5, 12.0, [1.0, 0.96, 0.65, 1.0]);
+    let br = c_lay.back_rect;
+    push_solid_quad(
+        out,
+        br.x - 1.5,
+        br.y - 1.5,
+        br.w + 3.0,
+        br.h + 3.0,
+        [0.45, 0.90, 1.0, 0.98],
+    );
+    push_solid_quad(out, br.x, br.y, br.w, br.h, [0.18, 0.30, 0.48, 0.95]);
+    let label = truncate_to_width(&menu.items[0].label, sc, (br.w - 16.0).max(24.0));
+    let lw = text_width(&label, sc);
+    push_text_line(
+        out,
+        &label,
+        br.x + (br.w - lw) * 0.5,
+        br.y + (br.h - th) * 0.5,
+        th,
+        [1.0, 0.96, 0.65, 1.0],
+    );
 }

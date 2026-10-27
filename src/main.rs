@@ -43,6 +43,7 @@ mod stats;
 mod status;
 mod training;
 mod traits;
+mod ui_text;
 mod waves;
 mod world;
 

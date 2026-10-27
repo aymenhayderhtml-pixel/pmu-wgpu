@@ -100,35 +100,46 @@ pub struct MenuLayout {
     pub row_count: usize,
 }
 
-/// Pure, allocation-free layout function computing centered menu panel and item rectangles.
+/// Pure, allocation-free layout function computing centered menu panel and item rectangles
+/// sized to fit the longest realistic row text (`62` chars) using `ui_text::fit_scale`.
 pub fn layout(screen_w: u32, screen_h: u32, hud_scale: u32, item_count: usize) -> MenuLayout {
     let sw = (screen_w.max(1)) as f32;
     let sh = (screen_h.max(1)) as f32;
     let count = item_count.min(MAX_MENU_ITEMS);
-    let hs = (hud_scale.clamp(1, 3)) as f32;
 
-    let max_avail_h = (sh - 24.0).max(200.0);
-    let header_space = (64.0 + hs * 16.0).min(max_avail_h * 0.26);
-    let avail_rows_h = (max_avail_h - header_space - 20.0).max(100.0);
+    let max_avail_w = (sw * 0.92).max(240.0);
+    let max_avail_h = (sh * 0.92).max(200.0);
 
-    let ideal_row_h = 22.0 + hs * 6.0;
-    let ideal_gap = 4.0 + hs * 1.5;
+    let w_at_1 = 62.0 * crate::ui_text::BASE_GLYPH_PX + 52.0; // 548px at scale 1
+    let row_h_1 = 22.0_f32;
+    let gap_1 = 4.0_f32;
+    let header_1 = 68.0_f32;
+    let h_at_1 = header_1 + (count as f32) * (row_h_1 + gap_1) + 20.0;
+
+    let sc = crate::ui_text::fit_scale(hud_scale.clamp(1, 3), w_at_1, h_at_1, max_avail_w, max_avail_h);
+    let hs = sc as f32;
+
+    let header_space = (52.0 + hs * 16.0).min(max_avail_h * 0.25);
+    let avail_rows_h = (max_avail_h - header_space - 20.0).max(80.0);
+
+    let ideal_row_h = 18.0 + hs * 6.0;
+    let ideal_gap = 3.0 + hs * 1.5;
     let total_ideal = (count.max(1) as f32) * (ideal_row_h + ideal_gap);
 
-    let fit_scale = if total_ideal > avail_rows_h {
+    let row_fit = if total_ideal > avail_rows_h {
         (avail_rows_h / total_ideal).clamp(0.45, 1.0)
     } else {
         1.0
     };
 
-    let row_h = (ideal_row_h * fit_scale).max(16.0);
-    let gap = (ideal_gap * fit_scale).max(2.0);
+    let row_h = (ideal_row_h * row_fit).max(14.0);
+    let gap = (ideal_gap * row_fit).max(2.0);
     let rows_total_h = (count as f32) * row_h + (count.saturating_sub(1) as f32) * gap;
 
-    let panel_w = (460.0 + hs * 80.0).min((sw - 24.0).max(240.0));
-    let panel_h = (header_space + rows_total_h + 24.0).min(max_avail_h);
-    let panel_x = ((sw - panel_w) * 0.5).max(12.0);
-    let panel_y = ((sh - panel_h) * 0.5).max(12.0);
+    let panel_w = (w_at_1 * hs).min(max_avail_w);
+    let panel_h = (header_space + rows_total_h + 20.0).min(max_avail_h);
+    let panel_x = ((sw - panel_w) * 0.5).max(8.0);
+    let panel_y = ((sh - panel_h) * 0.5).max(8.0);
 
     let title_y = panel_y + 12.0;
     let subtitle_y = title_y + 22.0 + hs * 6.0;

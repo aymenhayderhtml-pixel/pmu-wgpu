@@ -6,13 +6,15 @@ use crate::font::{
 use crate::game_flow::GameFlow;
 use crate::hud_life::draw_camp_banner_and_ally_icons;
 use crate::hud_menu::draw_active_menu_and_fade;
-use crate::hud_squad::draw_squad_hud_elements;
+use crate::hud_squad::{draw_squad_hud_elements, draw_toast_message};
 use crate::stats::HudTelemetry;
+use crate::ui_text::{
+    build_f3_panel_layout, fit_scale, text_height, text_width, truncate_to_width, BASE_GLYPH_PX,
+};
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec2, Vec3, Vec4};
 use std::fmt::Write;
 
-pub const HUD_SCALE: f32 = 2.0;
 pub const MAX_HUD_QUADS: usize = 4096;
 pub const MAX_HUD_VERTICES: usize = MAX_HUD_QUADS * 6;
 
@@ -393,138 +395,139 @@ impl HudRenderer {
             push_solid_quad(&mut self.vertex_scratch, bx, dg_y, hp_w * dg_ratio, dg_h, dg_color);
         }
 
-        // 6. F3 Top-left debug panel
-        if telemetry.show_panel {
-            let (panel_x, panel_y) = (10.0, 10.0);
-            let panel_w = 600.0 * (HUD_SCALE * 0.5);
-            let panel_h = line_step * 12.0 + 12.0;
-            push_solid_quad(&mut self.vertex_scratch, panel_x, panel_y, panel_w, panel_h, [0.02, 0.03, 0.05, 0.72]);
-
-            let text_x = panel_x + 8.0;
-            let mut text_y = panel_y + 8.0;
-            let text_color = [0.95, 0.98, 1.0, 1.0];
-
-            self.text_scratch.clear();
-            let _ = write!(&mut self.text_scratch, "FPS: {:5.1}   CPU: {:5.2} ms", telemetry.fps, telemetry.cpu_ms);
-            push_text_line(&mut self.vertex_scratch, &self.text_scratch, text_x, text_y, glyph_px, text_color);
-            text_y += line_step;
-
-            self.text_scratch.clear();
-            if let Some((gpu_total, gpu_shd)) = telemetry.gpu_total_and_shadow_ms {
-                let _ = write!(&mut self.text_scratch, "GPU: {:5.2} ms (Shd: {:4.2} ms)", gpu_total, gpu_shd);
-            } else {
-                let _ = write!(&mut self.text_scratch, "GPU: n/a");
-            }
-            push_text_line(&mut self.vertex_scratch, &self.text_scratch, text_x, text_y, glyph_px, text_color);
-            text_y += line_step;
-
-            self.text_scratch.clear();
-            let _ = write!(&mut self.text_scratch, "Pos: ({:5.1}, {:4.1}, {:5.1})", telemetry.player_pos.x, telemetry.player_pos.y, telemetry.player_pos.z);
-            push_text_line(&mut self.vertex_scratch, &self.text_scratch, text_x, text_y, glyph_px, [0.65, 0.95, 0.75, 1.0]);
-            text_y += line_step;
-
-            self.text_scratch.clear();
-            let _ = write!(&mut self.text_scratch, "Spd: {:4.1} m/s  Grounded: {}", telemetry.player_speed, if telemetry.player_grounded { "YES" } else { "NO" });
-            push_text_line(&mut self.vertex_scratch, &self.text_scratch, text_x, text_y, glyph_px, [0.65, 0.95, 0.75, 1.0]);
-            text_y += line_step;
-
-            self.text_scratch.clear();
-            let _ = write!(
-                &mut self.text_scratch,
-                "Draws:{} Tris:{}(Skn:{}) Inst:{}/{}(Shd:{})",
-                telemetry.draw_calls, telemetry.triangles, telemetry.skinned_triangles,
-                telemetry.visible_instances, telemetry.total_instances, telemetry.shadow_instances
+        // 6. Bottom-left controls hint line (measured via ui_text)
+        {
+            let h_sc = fit_scale(
+                1,
+                (CONTROLS_HINT.len() as f32) * BASE_GLYPH_PX + 16.0,
+                BASE_GLYPH_PX + 10.0,
+                sw - 20.0,
+                sh,
             );
-            push_text_line(&mut self.vertex_scratch, &self.text_scratch, text_x, text_y, glyph_px, text_color);
-            text_y += line_step;
-
-            self.text_scratch.clear();
-            let yaw_deg = telemetry.model_yaw_offset_rad.to_degrees().round() as i32;
-            let _ = write!(
-                &mut self.text_scratch,
-                "ShdQ:{} Mode:{:?} Scale:{:.2}x Yaw:{}d",
-                telemetry.shadow_quality.label(), telemetry.present_mode, telemetry.render_scale, yaw_deg
-            );
-            push_text_line(&mut self.vertex_scratch, &self.text_scratch, text_x, text_y, glyph_px, text_color);
-            text_y += line_step;
-
-            self.text_scratch.clear();
-            let ctrl_tag = if telemetry.anim_manual_override { "man" } else { "auto" };
-            let _ = write!(
-                &mut self.text_scratch,
-                "Anim:{}({}) '{}' t:{:.2}s Jnt:{}",
-                telemetry.anim_mode.label(), ctrl_tag, telemetry.anim_clip_name, telemetry.anim_clip_time, telemetry.joint_count
-            );
-            push_text_line(&mut self.vertex_scratch, &self.text_scratch, text_x, text_y, glyph_px, [0.98, 0.88, 0.55, 1.0]);
-            text_y += line_step;
-
-            let sc = telemetry.enemy_state_counts;
-            self.text_scratch.clear();
-            let _ = write!(&mut self.text_scratch, "Enemy[W:{} C:{} A:{} R:{} D:{}]", sc[0], sc[1], sc[2], sc[3], sc[4]);
-            push_text_line(&mut self.vertex_scratch, &self.text_scratch, text_x, text_y, glyph_px, [0.95, 0.75, 0.65, 1.0]);
-            text_y += line_step;
-
-            let ac = telemetry.ally_state_counts;
-            self.text_scratch.clear();
-            let _ = write!(
-                &mut self.text_scratch,
-                "Squad({})[F:{} E:{} A:{} R:{} G:{} D:{}]",
-                telemetry.squad_mode.label(), ac[0], ac[1], ac[2], ac[3], ac[4], ac[5]
-            );
-            push_text_line(&mut self.vertex_scratch, &self.text_scratch, text_x, text_y, glyph_px, [0.65, 0.98, 0.85, 1.0]);
-            text_y += line_step;
-
-            self.text_scratch.clear();
-            let _ = write!(&mut self.text_scratch, "A*: {}/s  Avg: {:.1} us", telemetry.astar_per_sec, telemetry.astar_avg_us);
-            push_text_line(&mut self.vertex_scratch, &self.text_scratch, text_x, text_y, glyph_px, [0.75, 0.90, 1.0, 1.0]);
-            text_y += line_step;
-
-            let c = telemetry.skills.counts;
-            self.text_scratch.clear();
-            let _ = write!(
-                &mut self.text_scratch,
-                "St:{} AlCast:{} Prj:{} Fx:{} Orb:{} Inv[{}{}{}{}{}|{}{}{}{}]",
-                telemetry.game_flow.label(),
-                telemetry.ally_casts,
-                telemetry.skills.active_projectiles,
-                telemetry.skills.active_effects,
-                telemetry.skills.active_orbs,
-                c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7], c[8]
-            );
-            push_text_line(&mut self.vertex_scratch, &self.text_scratch, text_x, text_y, glyph_px, [0.65, 0.85, 1.0, 1.0]);
-            text_y += line_step;
-
-            let ca = telemetry.camp_activity_counts;
-            self.text_scratch.clear();
-            let _ = write!(
-                &mut self.text_scratch,
-                "Camp:{}({:.0}s) Food:{} Act[E:{} R:{} T:{} S:{} Q:{} Z:{}] Fairy:{}",
-                if telemetry.in_camp_phase { "ON" } else { "OFF" },
-                telemetry.camp_timer,
-                telemetry.food_stock,
-                ca[0], ca[1], ca[2], ca[3], ca[4], ca[5],
-                telemetry.fairy_state
-            );
-            push_text_line(&mut self.vertex_scratch, &self.text_scratch, text_x, text_y, glyph_px, [0.95, 0.85, 1.0, 1.0]);
+            let h_th = text_height(h_sc);
+            let hint_str = truncate_to_width(CONTROLS_HINT, h_sc, (sw - 36.0).max(80.0));
+            let hint_w = text_width(&hint_str, h_sc) + 16.0;
+            let hint_h = h_th + 10.0;
+            let (hint_x, hint_y) = (10.0, (sh - hint_h - 8.0).max(10.0));
+            push_solid_quad(&mut self.vertex_scratch, hint_x, hint_y, hint_w, hint_h, [0.02, 0.03, 0.05, 0.68]);
+            push_text_line(&mut self.vertex_scratch, &hint_str, hint_x + 8.0, hint_y + 5.0, h_th, [0.88, 0.90, 0.95, 1.0]);
         }
 
-        // 7. Bottom-left controls hint line
-        let hint_scale = (HUD_SCALE * 0.65).max(1.0);
-        let hint_glyph_px = (GLYPH_SIZE as f32) * hint_scale;
-        let hint_w = (CONTROLS_HINT.len() as f32) * hint_glyph_px + 16.0;
-        let hint_h = hint_glyph_px + 10.0;
-        let (hint_x, hint_y) = (10.0, (sh - hint_h - 8.0).max(10.0));
-
-        push_solid_quad(&mut self.vertex_scratch, hint_x, hint_y, hint_w, hint_h, [0.02, 0.03, 0.05, 0.68]);
-        push_text_line(&mut self.vertex_scratch, CONTROLS_HINT, hint_x + 8.0, hint_y + 5.0, hint_glyph_px, [0.88, 0.90, 0.95, 1.0]);
-
-        // 8. Center crosshair dot, pause/gameover menus, and screen fade overlay
+        // 7. Center crosshair dot while Playing
         if telemetry.mouse_captured && telemetry.game_flow == GameFlow::Playing && !telemetry.player_dead {
             let dot_size = 2.0 * active_scale;
             let (cx, cy) = ((sw - dot_size) * 0.5, (sh - dot_size) * 0.5);
             push_solid_quad(&mut self.vertex_scratch, cx - 1.0, cy - 1.0, dot_size + 2.0, dot_size + 2.0, [0.0, 0.0, 0.0, 0.75]);
             push_solid_quad(&mut self.vertex_scratch, cx, cy, dot_size, dot_size, [1.0, 1.0, 1.0, 0.95]);
         }
+
+        // 8. F3 Top-left debug panel (ONLY drawn when GameFlow::Playing; measured with 6px padding and 0.55 alpha)
+        if telemetry.show_panel && telemetry.game_flow == GameFlow::Playing {
+            let gpu_str = if let Some((gt, gs)) = telemetry.gpu_total_and_shadow_ms {
+                format!("GPU: {:.2}ms (Shd: {:.2}ms)", gt, gs)
+            } else {
+                String::from("GPU: n/a")
+            };
+            let yaw_deg = telemetry.model_yaw_offset_rad.to_degrees().round() as i32;
+            let ctrl_tag = if telemetry.anim_manual_override { "man" } else { "auto" };
+            let sc = telemetry.enemy_state_counts;
+            let ac = telemetry.ally_state_counts;
+            let c = telemetry.skills.counts;
+            let ca = telemetry.camp_activity_counts;
+
+            let raw_lines = [
+                format!("FPS: {:.1}  CPU: {:.2}ms  {}", telemetry.fps, telemetry.cpu_ms, gpu_str),
+                format!(
+                    "Pos: ({:.1}, {:.1}, {:.1})  Spd: {:.1}m/s  Grounded: {}",
+                    telemetry.player_pos.x,
+                    telemetry.player_pos.y,
+                    telemetry.player_pos.z,
+                    telemetry.player_speed,
+                    if telemetry.player_grounded { "YES" } else { "NO" }
+                ),
+                format!(
+                    "Draws:{} Tris:{}(Skn:{}) Inst:{}/{}(Shd:{})",
+                    telemetry.draw_calls,
+                    telemetry.triangles,
+                    telemetry.skinned_triangles,
+                    telemetry.visible_instances,
+                    telemetry.total_instances,
+                    telemetry.shadow_instances
+                ),
+                format!(
+                    "ShdQ:{} Mode:{:?} Scale:{:.2}x Yaw:{}d",
+                    telemetry.shadow_quality.label(),
+                    telemetry.present_mode,
+                    telemetry.render_scale,
+                    yaw_deg
+                ),
+                format!(
+                    "Anim:{}({}) '{}' t:{:.2}s Jnt:{}",
+                    telemetry.anim_mode.label(),
+                    ctrl_tag,
+                    telemetry.anim_clip_name,
+                    telemetry.anim_clip_time,
+                    telemetry.joint_count
+                ),
+                format!(
+                    "Enemy[W:{} C:{} A:{} R:{} D:{}]  A*: {}/s ({:.1}us)",
+                    sc[0], sc[1], sc[2], sc[3], sc[4], telemetry.astar_per_sec, telemetry.astar_avg_us
+                ),
+                format!(
+                    "Squad({})[F:{} E:{} A:{} R:{} G:{} D:{}] AlCast:{}",
+                    telemetry.squad_mode.label(),
+                    ac[0], ac[1], ac[2], ac[3], ac[4], ac[5],
+                    telemetry.ally_casts
+                ),
+                format!(
+                    "St:{} MP:{:.0} Prj:{} Fx:{} Orb:{} Inv[{}{}{}{}{}|{}{}{}{}]",
+                    telemetry.game_flow.label(),
+                    telemetry.skills.mana,
+                    telemetry.skills.active_projectiles,
+                    telemetry.skills.active_effects,
+                    telemetry.skills.active_orbs,
+                    c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7], c[8]
+                ),
+                format!(
+                    "Camp:{}({:.0}s) Food:{} Act[E:{} R:{} T:{} S:{} Q:{} Z:{}] Fairy:{}",
+                    if telemetry.in_camp_phase { "ON" } else { "OFF" },
+                    telemetry.camp_timer,
+                    telemetry.food_stock,
+                    ca[0], ca[1], ca[2], ca[3], ca[4], ca[5],
+                    telemetry.fairy_state
+                ),
+            ];
+
+            let (f3_lay, wrapped_lines) =
+                build_f3_panel_layout(&raw_lines, telemetry.hud_scale, sw, sh);
+            let fp = f3_lay.panel;
+            let f_th = text_height(f3_lay.scale);
+            push_solid_quad(
+                &mut self.vertex_scratch,
+                fp.x,
+                fp.y,
+                fp.w,
+                fp.h,
+                [0.02, 0.03, 0.05, 0.55],
+            );
+
+            for (i, line_str) in wrapped_lines.iter().enumerate() {
+                let tr = f3_lay.text_rects[i];
+                push_text_line(
+                    &mut self.vertex_scratch,
+                    line_str,
+                    tr.x,
+                    tr.y,
+                    f_th,
+                    [0.95, 0.98, 1.0, 1.0],
+                );
+            }
+        }
+
+        // 9. Toasts (drawn over HUD/F3, underneath modal menus)
+        draw_toast_message(&mut self.vertex_scratch, sw, sh, telemetry);
+
+        // 10. Modal Menus drawn LAST over everything (including their own dark overlay + fade)
         let _ = DEATH_MESSAGE;
         draw_active_menu_and_fade(&mut self.vertex_scratch, &mut self.text_scratch, sw, sh, telemetry);
 
